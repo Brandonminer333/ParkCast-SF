@@ -1,0 +1,11 @@
+FROM ghcr.io/mlflow/mlflow:latest
+
+RUN pip install google-cloud-storage
+
+EXPOSE 5000
+
+CMD ["mlflow", "server", \
+     "--host", "0.0.0.0", \
+     "--port", "5000", \
+     "--default-artifact-root", "gs://parkcast-dev/mlflow-artifacts", \
+     "--backend-store-uri", "sqlite:////mnt/mlflow/mlflow.db"]

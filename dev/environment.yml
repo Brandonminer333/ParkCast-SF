@@ -1,0 +1,13 @@
+name: parkcast-dev
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - requests
+  - ipykernel
+  - pandas
+  - numpy
+  - matplotlib
+  - pyarrow
+  - scikit-learn
