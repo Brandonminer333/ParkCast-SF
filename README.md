@@ -11,9 +11,9 @@ ParkCast SF is a machine learning web service that predicts parking occupancy 30
 **Group:** Parkcast SF
 **Members:** 
 
-**Brandon Miner**,
+**Brandon Miner**
 
-**Kyvan Zahiri**,
+**Kyvan Zahiri**
 
 **Temesghen Kahsay**
 
