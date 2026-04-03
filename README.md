@@ -12,7 +12,13 @@ ParkCast SF is a machine learning web service that predicts parking occupancy 30
 **Members:** 
 
 **Brandon Miner**
+HEAD
 **Kyvan Zahiri**
+
+
+**Kayvan Zahiri**
+
+refs/remotes/origin/main
 **Temesghen Kahsay**
 
 ---
@@ -76,8 +82,13 @@ parcast/
 
 **1. Clone the repo:**
 ```bash
+<<<<<<< HEAD
 git clone https://github.com/YOUR_USERNAME/parcast.git
 cd parcast
+=======
+git clone https://github.com/YOUR_USERNAME/parkcast.git
+cd parkcast
+>>>>>>> refs/remotes/origin/main
 ```
 
 **2. Create and activate virtual environment:**
