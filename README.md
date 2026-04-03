@@ -13,7 +13,7 @@ ParkCast SF is a machine learning web service that predicts parking occupancy 30
 
 **Brandon Miner**
 
-**Kyvan Zahiri**
+**Kayvan Zahiri**
 
 **Temesghen Kahsay**
 
