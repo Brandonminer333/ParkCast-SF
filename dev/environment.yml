@@ -11,3 +11,6 @@ dependencies:
   - matplotlib
   - pyarrow
   - scikit-learn
+  - fastapi[standard]
+  - uvicorn
+  - mlflow
