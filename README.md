@@ -78,8 +78,8 @@ parcast/
 
 **1. Clone the repo:**
 ```bash
-git clone https://github.com/YOUR_USERNAME/parcast.git
-cd parcast
+git clone https://github.com/YOUR_USERNAME/parkcast.git
+cd parkcast
 ```
 
 **2. Create and activate virtual environment:**
