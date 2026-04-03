@@ -14,21 +14,37 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
+import logging
 
-# ── Config ────────────────────────────────────────────────────
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "RandomForest.pkl")
 
-# ── Load model at startup ─────────────────────────────────────
+# ── Setup logging ─────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+import mlflow.sklearn
+
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://34.133.160.231:5000")
+MODEL_NAME = "parkcast-occupancy-model"
+
+# tracking 
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
 model = None
 
 def load_model():
     global model
     try:
-        model = joblib.load(MODEL_PATH)
-        print(f"Model loaded successfully from {MODEL_PATH}")
+        model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
+        print(f"Model loaded from MLflow registry: {MODEL_NAME}@champion")
     except Exception as e:
-        print(f"Failed to load model: {e}")
-        model = None
+        print(f"Failed to load from MLflow registry: {e}")
+        # Fallback to local model
+        try:
+            model = joblib.load("models/RandomForest.pkl")
+            print("Loaded fallback local model")
+        except Exception as e2:
+            print(f"Failed to load fallback model: {e2}")
+            model = None
 
 load_model()
 
