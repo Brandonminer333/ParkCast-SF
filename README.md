@@ -119,7 +119,9 @@ http://localhost:8000/docs
 **Option 1 — Pull from Docker Hub:**
 ```bash
 docker pull YOUR_DOCKERHUB_USERNAME/parkcast-api:latest
-docker run -d -p 8000:8000 YOUR_DOCKERHUB_USERNAME/parkcast-api:latest
+docker run -d -p 8000:8000 \
+  -e MLFLOW_TRACKING_URI=YOUR_MLFLOW_SERVER_URI \
+  YOUR_DOCKERHUB_USERNAME/parkcast-api:latest
 ```
 
 **Option 2 — Build locally:**
