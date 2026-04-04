@@ -196,6 +196,13 @@ All experiments are tracked on a shared GCP MLflow server.
 - **Model Registry:** `parkcast-occupancy-model`
 
 ---
+## Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `MLFLOW_TRACKING_URI` | URL of your MLflow tracking server | `http://YOUR_MLFLOW_SERVER_IP:5000` |
+
+---
 
 ## Tech Stack
 
