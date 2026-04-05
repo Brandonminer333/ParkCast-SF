@@ -119,7 +119,9 @@ http://localhost:8000/docs
 **Option 1 — Pull from Docker Hub:**
 ```bash
 docker pull YOUR_DOCKERHUB_USERNAME/parkcast-api:latest
-docker run -d -p 8000:8000 YOUR_DOCKERHUB_USERNAME/parkcast-api:latest
+docker run -d -p 8000:8000 \
+  -e MLFLOW_TRACKING_URI=YOUR_MLFLOW_SERVER_URI \
+  YOUR_DOCKERHUB_USERNAME/parkcast-api:latest
 ```
 
 **Option 2 — Build locally:**
@@ -192,6 +194,13 @@ All experiments are tracked on a shared GCP MLflow server.
 - **Tracking URI:** `http://34.133.160.231:5000`
 - **Experiments:** `parkcast-data-ingestion`, `parkcast-training`
 - **Model Registry:** `parkcast-occupancy-model`
+
+---
+## Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `MLFLOW_TRACKING_URI` | URL of your MLflow tracking server | `http://YOUR_MLFLOW_SERVER_IP:5000` |
 
 ---
 
