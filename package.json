@@ -1,0 +1,20 @@
+{
+  "name": "parkcast",
+  "version": "1.0.0",
+  "description": "parking assistor",
+  "homepage": "https://github.com/Brandonminer333/ParkCast-SF#readme",
+  "bugs": {
+    "url": "https://github.com/Brandonminer333/ParkCast-SF/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Brandonminer333/ParkCast-SF.git"
+  },
+  "license": "ISC",
+  "author": "Brandon Miner",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "test"
+  }
+}
