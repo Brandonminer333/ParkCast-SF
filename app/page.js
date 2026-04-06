@@ -12,11 +12,11 @@ export default function Home() {
   const [history, setHistory] = useState([]);
   const [apiStatus, setApiStatus] = useState(null);
 
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+  const API_URL = '';
 
   // Check API health on load
   useEffect(() => {
-    fetch(`${API_URL}/health`)
+    fetch(`/api/health`)
       .then(res => res.json())
       .then(data => setApiStatus(data))
       .catch(() => setApiStatus({ status: 'unavailable' }));
@@ -26,7 +26,7 @@ export default function Home() {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${API_URL}/predict`, {
+      const response = await fetch(`/api/predict`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData),
