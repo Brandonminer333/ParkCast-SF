@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
 import logging
+from fastapi.middleware.cors import CORSMiddleware
 
 
 # ── Setup logging ─────────────────────────────────────────────
@@ -30,6 +31,21 @@ MODEL_NAME = "parkcast-occupancy-model"
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 
 model = None
+
+# ── FastAPI app ───────────────────────────────────────────────
+app = FastAPI(
+    title="ParkCast SF API",
+    description="Predicts parking availability in San Francisco 30-60 minutes ahead.",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "https://*.vercel.app"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def load_model():
     global model
@@ -47,13 +63,6 @@ def load_model():
             model = None
 
 load_model()
-
-# ── FastAPI app ───────────────────────────────────────────────
-app = FastAPI(
-    title="ParkCast SF API",
-    description="Predicts parking availability in San Francisco 30-60 minutes ahead.",
-    version="1.0.0",
-)
 
 # ── Feature order must match training ────────────────────────
 FEATURE_ORDER = [
