@@ -14,6 +14,21 @@ const NEIGHBORHOODS = [
   { value: 'richmond', label: 'Richmond' },
 ];
 
+const MONTHS = [
+  { value: 1, label: 'January' },
+  { value: 2, label: 'February' },
+  { value: 3, label: 'March' },
+  { value: 4, label: 'April' },
+  { value: 5, label: 'May' },
+  { value: 6, label: 'June' },
+  { value: 7, label: 'July' },
+  { value: 8, label: 'August' },
+  { value: 9, label: 'September' },
+  { value: 10, label: 'October' },
+  { value: 11, label: 'November' },
+  { value: 12, label: 'December' },
+];
+
 const DAYS = [
   { value: 0, label: 'Monday' },
   { value: 1, label: 'Tuesday' },
@@ -74,7 +89,7 @@ export default function PredictionForm({ onSubmit, loading }) {
       {/* Hour + Day */}
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className={labelClass}>Hour: {form.hour}:00</label>
+          <label className={labelClass}>Hour: {form.hour === 0 ? 12 : form.hour > 12 ? form.hour - 12 : form.hour}:00 {form.hour < 12 ? 'AM' : 'PM'}</label>
           <input type="range" name="hour" min="0" max="23" value={form.hour}
             onChange={handleChange} className="w-full accent-teal-500" />
         </div>
@@ -92,8 +107,11 @@ export default function PredictionForm({ onSubmit, loading }) {
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className={labelClass}>Month</label>
-          <input type="number" name="month" min="1" max="12" value={form.month}
-            onChange={handleChange} className={inputClass} />
+          <select name="month" value={form.month} onChange={handleChange} className={inputClass}>
+            {MONTHS.map(m => (
+              <option key={m.value} value={m.value}>{m.label}</option>
+            ))}
+          </select>
         </div>
         <div>
           <label className={labelClass}>Total spaces</label>

@@ -40,7 +40,7 @@ export default function Home() {
       // Add to history
       const historyEntry = {
         id: Date.now(),
-        timestamp: new Date().toLocaleTimeString(),
+        timestamp: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }),
         neighborhood: formData.neighborhood,
         hour: formData.hour,
         occupancy: result.predicted_occupancy_pct,
