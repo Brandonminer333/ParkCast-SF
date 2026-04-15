@@ -1,0 +1,55 @@
+{
+  "features": [
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "is_holiday",
+    "is_school_day",
+    "is_raining",
+    "temperature",
+    "event_intensity",
+    "citation_count",
+    "citations_hourly_median",
+    "lat",
+    "lon",
+    "total_spaces",
+    "block_mean",
+    "block_hour_mean",
+    "lag_7d",
+    "lag_14d",
+    "lag_28d",
+    "neighborhood"
+  ],
+  "target": "occupancy_pct",
+  "split_time": "2026-01-27 16:00:00",
+  "train_rows": 2938898,
+  "val_rows": 326545,
+  "test_rows": 816714,
+  "best_iteration": 71,
+  "global_mean": 36.67949555921986,
+  "metrics": {
+    "baseline": {
+      "n": 816714,
+      "mae": 14.060089822646553,
+      "r2": 0.48023651582625393
+    },
+    "residual_model": {
+      "n": 816714,
+      "mae": 13.960453764907188,
+      "r2": 0.48364434360473285
+    },
+    "baseline_events": {
+      "n": 4232,
+      "mae": 14.172926517070632,
+      "r2": 0.4378253019114202
+    },
+    "residual_events": {
+      "n": 4232,
+      "mae": 14.169261400109361,
+      "r2": 0.4360013317393048
+    },
+    "winner": "residual_model"
+  },
+  "note": "Trained only on real meter-hour rows. Off-hour predictions are out of scope for this model."
+}

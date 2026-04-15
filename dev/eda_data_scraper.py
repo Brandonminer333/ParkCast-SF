@@ -4,11 +4,12 @@ Downloads raw datasets from SF Open Data (Socrata) and Open-Meteo APIs
 for exploratory data analysis.
 
 Datasets:
-  1. Parking Meter Transactions  — SFMTA (50k most recent)
+  1. Parking Meter Transactions  — SFMTA (incremental downloads)
   2. Parking Meter Locations     — SFMTA (all)
-  3. Street Sweeping Schedule    — DPW (50k)
+  3. Street Sweeping Schedule    — DPW (incremental downloads)
   4. Street-Use Permits          — DPW (10k most recent)
-  5. Weather (hourly, 90 days)   — Open-Meteo
+  5. Parking Regulations         — SFMTA (for unmetered areas)
+  6. Weather (hourly, 90 days)   — Open-Meteo
 
 Output:
   All files are saved to the data/ directory as CSVs.
@@ -32,8 +33,8 @@ DATA_DIR = os.path.join(PROJECT_DIR, "data")
 # DataSF (Socrata) datasets — each entry: (filename, url, description)
 DATASETS = {
     "meter_transactions.csv": (
-        "https://data.sfgov.org/resource/imvp-dq3v.csv?$limit=50000&$order=session_start_dt%20DESC",
-        "SFMTA Parking Meter Transactions (50k most recent)",
+        "https://data.sfgov.org/resource/imvp-dq3v.csv?$limit=1000000&$order=session_start_dt%20DESC",
+        "SFMTA Parking Meter Transactions",
     ),
     "meter_locations.csv": (
         "https://data.sfgov.org/resource/8vzz-qzz9.csv?$limit=50000",
@@ -45,29 +46,70 @@ DATASETS = {
     ),
     "street_use_permits.csv": (
         "https://data.sfgov.org/resource/b6tj-gt35.csv?$limit=10000&$order=data_as_of%20DESC",
-        "Street-Use Permits (10k most recent)",
+        "Street-Use Permits",
+    ),
+    "parking_regulations.csv": (
+        "https://data.sfgov.org/resource/hi6h-neyh.csv?$limit=50000",
+        "SF Parking Regulations (RPP/Color Curbs)",
+    ),
+    "street_closures.csv": (
+        "https://data.sfgov.org/resource/8x25-yybr.csv?$limit=10000",
+        "SF Temporary Street Closures (Events Proxy)",
+    ),
+    # Citations give us 24/7 parking demand signal — meters are free at night,
+    # so paid-meter transactions show false zeros overnight. Citations (esp.
+    # street-cleaning tickets) are issued around the clock and prove a car
+    # was occupying that spot. Window is narrowed to the transaction range to
+    # skip the ~year of spurious future-dated rows in the raw dataset.
+    "parking_citations.csv": (
+        "https://data.sfgov.org/resource/ab4h-6ztd.csv?"
+        "$where=citation_issued_datetime%20between%20"
+        "'2025-04-13T00:00:00'%20and%20'2026-04-13T00:00:00'"
+        "&$limit=3000000",
+        "SFMTA Parking Citations (24/7 demand proxy, 12 months)",
     ),
 }
 
-# Open-Meteo weather URL (last 90 days, hourly, San Francisco)
+# Open-Meteo archive API — 12 months of hourly weather (San Francisco)
 WEATHER_URL = (
-    "https://api.open-meteo.com/v1/forecast?"
+    "https://archive-api.open-meteo.com/v1/archive?"
     "latitude=37.7749&longitude=-122.4194"
+    "&start_date=2025-04-13&end_date=2026-04-13"
     "&hourly=temperature_2m,relative_humidity_2m,precipitation,rain,weathercode,windspeed_10m,cloudcover"
-    "&past_days=90&forecast_days=1&timezone=America/Los_Angeles"
+    "&timezone=America/Los_Angeles"
 )
 
 
 def download_dataset(url, dest_path, description):
-    """Download a single dataset to dest_path (always re-downloads)."""
-    print(f"Downloading {description}...")
+    """Download a dataset. If it exists, append and de-duplicate."""
+    print(f"Syncing {description}...")
+    temp_path = dest_path + ".tmp"
     try:
-        urllib.request.urlretrieve(url, dest_path)
+        # Download new data
+        urllib.request.urlretrieve(url, temp_path)
+        df_new = pd.read_csv(temp_path)
+
+        if os.path.exists(dest_path):
+            # Load old data and merge
+            df_old = pd.read_csv(dest_path)
+            df_combined = pd.concat([df_old, df_new]).drop_duplicates().reset_index(drop=True)
+            df_combined.to_csv(dest_path, index=False)
+            print(f"  → Merged {len(df_new)} new with {len(df_old)} existing records")
+        else:
+            # First download
+            df_new.to_csv(dest_path, index=False)
+            print(f"  → Initial download: {len(df_new)} records")
+
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
         size_mb = os.path.getsize(dest_path) / 1e6
-        print(f"  → {size_mb:.1f} MB")
+        print(f"  → Total file size: {size_mb:.1f} MB")
         return True
     except Exception as e:
-        print(f"  ERROR downloading {description}: {e}")
+        print(f"  ERROR syncing {description}: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
         return False
 
 
