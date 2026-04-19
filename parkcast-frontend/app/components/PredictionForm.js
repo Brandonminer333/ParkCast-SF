@@ -14,6 +14,21 @@ const NEIGHBORHOODS = [
   { value: 'richmond', label: 'Richmond' },
 ];
 
+const MONTHS = [
+  { value: 1, label: 'January' },
+  { value: 2, label: 'February' },
+  { value: 3, label: 'March' },
+  { value: 4, label: 'April' },
+  { value: 5, label: 'May' },
+  { value: 6, label: 'June' },
+  { value: 7, label: 'July' },
+  { value: 8, label: 'August' },
+  { value: 9, label: 'September' },
+  { value: 10, label: 'October' },
+  { value: 11, label: 'November' },
+  { value: 12, label: 'December' },
+];
+
 const DAYS = [
   { value: 0, label: 'Monday' },
   { value: 1, label: 'Tuesday' },
@@ -24,31 +39,43 @@ const DAYS = [
   { value: 6, label: 'Sunday' },
 ];
 
-export default function PredictionForm({ onSubmit, loading }) {
+export default function PredictionForm({ onSubmit, loading, weather, onWeatherChange }) {
   const now = new Date();
+  const weatherTemp = weather ? Math.round(weather.temperature_2m) : 62;
+  const weatherCode = weather ? weather.weather_code : 0;
+  const weatherRaining = weather ? (weather.rain > 0 || (weatherCode >= 51 && weatherCode <= 82)) ? 1 : 0 : 0;
+
   const [form, setForm] = useState({
     neighborhood: 'mission',
     hour: now.getHours(),
     day_of_week: now.getDay() === 0 ? 6 : now.getDay() - 1,
     month: now.getMonth() + 1,
     total_spaces: 40,
-    is_raining: 0,
+    is_raining: weatherRaining,
     has_nearby_event: 0,
     is_holiday: 0,
     is_school_day: 1,
-    temperature: 62,
+    temperature: weatherTemp,
   });
+
 
   const handleChange = (e) => {
     const { name, value, type } = e.target;
-    setForm(prev => ({
-      ...prev,
-      [name]: type === 'number' || type === 'range' ? Number(value) : value,
-    }));
+    const parsed = type === 'number' || type === 'range' ? Number(value) : value;
+    setForm(prev => ({ ...prev, [name]: parsed }));
+    if (name === 'temperature') {
+      onWeatherChange?.({ temperature: Number(value), is_raining: form.is_raining === 1 });
+    } else if (name === 'is_raining') {
+      onWeatherChange?.({ temperature: form.temperature, is_raining: Number(value) === 1 });
+    }
   };
 
   const handleToggle = (name) => {
-    setForm(prev => ({ ...prev, [name]: prev[name] === 1 ? 0 : 1 }));
+    const toggled = form[name] === 1 ? 0 : 1;
+    setForm(prev => ({ ...prev, [name]: toggled }));
+    if (name === 'is_raining') {
+      onWeatherChange?.({ temperature: form.temperature, is_raining: toggled === 1 });
+    }
   };
 
   const handleSubmit = (e) => {
@@ -74,7 +101,7 @@ export default function PredictionForm({ onSubmit, loading }) {
       {/* Hour + Day */}
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className={labelClass}>Hour: {form.hour}:00</label>
+          <label className={labelClass}>Hour: {form.hour === 0 ? 12 : form.hour > 12 ? form.hour - 12 : form.hour}:00 {form.hour < 12 ? 'AM' : 'PM'}</label>
           <input type="range" name="hour" min="0" max="23" value={form.hour}
             onChange={handleChange} className="w-full accent-teal-500" />
         </div>
@@ -92,8 +119,11 @@ export default function PredictionForm({ onSubmit, loading }) {
       <div className="grid grid-cols-2 gap-3">
         <div>
           <label className={labelClass}>Month</label>
-          <input type="number" name="month" min="1" max="12" value={form.month}
-            onChange={handleChange} className={inputClass} />
+          <select name="month" value={form.month} onChange={handleChange} className={inputClass}>
+            {MONTHS.map(m => (
+              <option key={m.value} value={m.value}>{m.label}</option>
+            ))}
+          </select>
         </div>
         <div>
           <label className={labelClass}>Total spaces</label>
