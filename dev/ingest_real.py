@@ -27,8 +27,8 @@ DATA_DIR            = "data"
 OUTPUT_FILE         = os.path.join(DATA_DIR, "parkcast_raw.csv")
 
 # Pull last 90 days of real data
-END_DATE   = datetime.today()
-START_DATE = END_DATE - timedelta(days=90)
+END_DATE   = datetime(2017, 3, 1)
+START_DATE = datetime(2017, 1, 1)
 DATE_FMT   = "%Y-%m-%d"
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -40,7 +40,7 @@ mlflow.set_experiment(EXPERIMENT_NAME)
 # ─────────────────────────────────────────────────────────────
 # SOURCE 1: Real SFpark Meter Occupancy Data
 # SF Open Data: Parking meter transactions with occupancy
-# https://data.sfgov.org/resource/uupn-yfaw.json
+# https://data.sfgov.org/resource/imvp-dq3v.json
 # ─────────────────────────────────────────────────────────────
 def fetch_sfpark_real():
     """
@@ -50,7 +50,7 @@ def fetch_sfpark_real():
     """
     print("Fetching real SFpark meter data from SF Open Data...")
 
-    url = "https://data.sfgov.org/resource/uupn-yfaw.json"
+    url = "https://data.sfgov.org/resource/imvp-dq3v.json"
 
     start_str = START_DATE.strftime("%Y-%m-%dT00:00:00")
     end_str   = END_DATE.strftime("%Y-%m-%dT23:59:59")
