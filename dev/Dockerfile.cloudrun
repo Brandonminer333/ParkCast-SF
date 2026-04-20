@@ -1,0 +1,24 @@
+# ── ParkCast SF — Cloud Run Dockerfile ──────────────────────
+# Optimized for Google Cloud Run:
+# - Single container, no external dependencies at runtime
+# - Loads model from MLflow registry via env variable
+# - Listens on PORT env variable (Cloud Run requirement)
+
+FROM python:3.11-slim
+
+# Cloud Run requires the app to listen on $PORT
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install dependencies first (layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy app and model
+COPY app/ ./app/
+COPY models/ ./models/
+
+# Cloud Run uses $PORT — uvicorn must bind to it
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
