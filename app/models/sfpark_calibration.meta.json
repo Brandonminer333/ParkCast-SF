@@ -1,0 +1,39 @@
+{
+  "district_to_neighborhoods": {
+    "Downtown": [
+      "Financial District/South Beach"
+    ],
+    "Civic Center": [
+      "Tenderloin",
+      "Hayes Valley"
+    ],
+    "Fillmore": [
+      "Western Addition",
+      "Pacific Heights"
+    ],
+    "Marina": [
+      "Marina"
+    ],
+    "Fisherman's Wharf": [
+      "North Beach",
+      "Russian Hill"
+    ],
+    "Mission": [
+      "Mission"
+    ],
+    "South Embarcadero": [
+      "Mission Bay",
+      "South of Market"
+    ],
+    "Union": [
+      "Nob Hill",
+      "Chinatown"
+    ],
+    "Inner Richmond": [
+      "Inner Richmond"
+    ],
+    "West Portal": [
+      "West of Twin Peaks"
+    ]
+  }
+}

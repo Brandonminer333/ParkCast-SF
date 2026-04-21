@@ -1,2 +1,5 @@
 *.csv
-__pycache__.DS_Store
+*.json
+__pycache__
+.DS_Store
+*.log
