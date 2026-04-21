@@ -1,32 +1,75 @@
+"""Tests for app.main.
+
+The service loads real parquet assets at startup. These tests swap the module
+globals with minimal fakes so the FastAPI app can be exercised without
+shipping the ~1.5 MB of parquet fixtures.
+"""
+
+from __future__ import annotations
+
 import importlib
 import pathlib
 import sys
+from datetime import datetime
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
 
 @pytest.fixture(scope="function")
 def main_module(monkeypatch):
-    """Reload app.main with patched model loading to avoid external dependencies."""
-
-    # Ensure repository root is on sys.path so `import app.main` works when pytest
-    # is run from within tests/.
+    """Import `app.main` with `_load_all` neutered, then swap in fake assets."""
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    import mlflow.sklearn
-    import joblib
+    import app.main as main_mod
+    main_mod = importlib.reload(main_mod)
+    monkeypatch.setattr(main_mod, "_load_all", lambda: None)
 
     class DummyModel:
         def predict(self, X):
-            return [50.0]
+            return np.full(len(X), 5.0)
 
-    # Prevent real registry/disk access during import-time load_model()
-    monkeypatch.setattr(mlflow.sklearn, "load_model", lambda *_, **__: DummyModel())
-    monkeypatch.setattr(joblib, "load", lambda *_, **__: DummyModel())
+    blocks = pd.DataFrame([
+        {"lat": 37.7816, "lon": -122.3975, "neighborhood": "soma", "total_spaces": 42},
+        {"lat": 37.7820, "lon": -122.3968, "neighborhood": "soma", "total_spaces": 38},
+        {"lat": 37.7500, "lon": -122.4800, "neighborhood": "sunset", "total_spaces": 30},
+    ])
 
-    main_mod = importlib.reload(importlib.import_module("app.main"))
+    block_aggs = pd.DataFrame([
+        {"lat": 37.7816, "lon": -122.3975, "hour": h, "day_of_week": d,
+         "block_mean": 60.0, "block_hour_mean": 62.0, "block_hour_dow_mean": 65.0}
+        for h in range(24) for d in range(7)
+    ] + [
+        {"lat": 37.7820, "lon": -122.3968, "hour": h, "day_of_week": d,
+         "block_mean": 55.0, "block_hour_mean": 55.0, "block_hour_dow_mean": 55.0}
+        for h in range(24) for d in range(7)
+    ])
+
+    lag_hist = pd.DataFrame(columns=["lat", "lon", "timestamp", "occupancy_pct"])
+    cit_lookup = pd.DataFrame([
+        {"hour": h, "day_of_week": d, "citations_hourly_median": 0.0}
+        for h in range(24) for d in range(7)
+    ])
+    events = pd.DataFrame(columns=["date", "venue_lat", "venue_lon",
+                                   "start_hour", "end_hour"])
+
+    main_mod.model = DummyModel()
+    main_mod.blocks = blocks
+    main_mod.block_aggs = block_aggs
+    main_mod.master = None
+    main_mod.lag_hist = lag_hist
+    main_mod.cit_lookup = cit_lookup
+    main_mod.events = events
+    main_mod.meta = {"metrics": {"residual_model": {"mae": 4.95}}}
+    main_mod.global_baseline_mean = 50.0
+
+    monkeypatch.setattr(main_mod, "weather_for", lambda ts: (62.0, 0))
+
     return main_mod
 
 
@@ -40,140 +83,110 @@ def test_root_returns_welcome(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["message"].startswith("Welcome to ParkCast SF API")
-    assert "health" in body["endpoints"]
+    assert "predict_blocks" in body["endpoints"]
 
 
-def test_health_returns_service_unavailable_when_model_missing(client, main_module):
+def test_health_503_when_model_missing(client, main_module):
     main_module.model = None
     resp = client.get("/health")
     assert resp.status_code == 503
     assert "Model not loaded" in resp.json()["detail"]
 
 
-def test_health_returns_ok_with_model_loaded(client, main_module):
-    class DummyModel:
-        pass
-
-    main_module.model = DummyModel()
+def test_health_ok_reports_block_count(client, main_module):
     resp = client.get("/health")
     assert resp.status_code == 200
     payload = resp.json()
+    assert payload["status"] == "healthy"
     assert payload["model_loaded"] is True
-    assert payload["num_features"] == len(main_module.FEATURE_ORDER)
-    assert payload["model_type"] == "DummyModel"
+    assert payload["num_features"] == len(main_module.FEATURES)
+    assert payload["total_blocks_in_db"] == 3
+    assert payload["trained_test_mae"] == 4.95
 
 
-def test_prepare_features_sets_weekend_rush_and_street_cleaning(main_module):
-    input_obj = main_module.ParkingInput(
-        hour=8,
-        day_of_week=6,  # Sunday
-        month=5,
-        neighborhood="mission",
-        total_spaces=20,
-        is_raining=1,
-        has_nearby_event=0,
-        is_holiday=0,
-        is_school_day=0,
-        temperature=55.0,
-    )
-    features = main_module.prepare_features(input_obj)
-    assert features.shape == (1, len(main_module.FEATURE_ORDER))
-    # weekend, rush hour (8am), and street cleaning (8-12) all flagged
-    assert features[0, 3] == 1  # is_weekend
-    assert features[0, 4] == 1  # is_rush_hour
-    assert features[0, 5] == 1  # is_street_cleaning
+@pytest.mark.parametrize("occ,expected", [
+    (0, "Low"), (39.9, "Low"),
+    (40, "Medium"), (69.9, "Medium"),
+    (70, "High"), (84.9, "High"),
+    (85, "Very High"), (100, "Very High"),
+])
+def test_demand_level_boundaries(main_module, occ, expected):
+    assert main_module.demand_level(occ) == expected
 
 
-def test_prepare_features_handles_unknown_neighborhood(main_module):
-    input_obj = main_module.ParkingInput(
-        hour=12,
-        day_of_week=2,
-        month=1,
-        neighborhood="unknown-neighborhood",
-        total_spaces=10,
-        is_raining=0,
-        has_nearby_event=0,
-        is_holiday=0,
-        is_school_day=1,
-        temperature=60.0,
-    )
-    features = main_module.prepare_features(input_obj)
-    encoded_value = features[0, -1]
-    assert encoded_value == main_module.NEIGHBORHOOD_MAP["unknown"]
+@pytest.mark.parametrize("occ,expected_hex", [
+    (10, "#22c55e"), (55, "#f59e0b"), (77, "#f97316"), (95, "#ef4444"),
+])
+def test_color_matches_legend(main_module, occ, expected_hex):
+    assert main_module.color_for(occ) == expected_hex
 
 
-@pytest.mark.parametrize(
-    "occupancy, expected",
-    [
-        (0, "Low"),
-        (39.9, "Low"),
-        (40, "Medium"),
-        (69.9, "Medium"),
-        (70, "High"),
-        (84.9, "High"),
-        (85, "Very High"),
-        (100, "Very High"),
-    ],
-)
-def test_get_demand_level_boundaries(main_module, occupancy, expected):
-    assert main_module.get_demand_level(occupancy) == expected
+def test_is_school_day_heuristic(main_module):
+    from datetime import date as _date
+    assert main_module.is_school_day(_date(2026, 3, 4)) == 1
+    assert main_module.is_school_day(_date(2026, 3, 7)) == 0
+    assert main_module.is_school_day(_date(2026, 7, 15)) == 0
+    assert main_module.is_school_day(_date(2026, 1, 1)) == 0
 
 
-@pytest.mark.parametrize(
-    "occupancy, snippet",
-    [
-        (10, "plenty of spaces"),
-        (50, "Good chance"),
-        (75, "Limited spots"),
-        (95, "Very hard to park"),
-    ],
-)
-def test_get_recommendation_text(main_module, occupancy, snippet):
-    assert snippet in main_module.get_recommendation(occupancy)
-
-
-def test_predict_returns_enriched_response(client, main_module):
-    class PredictModel:
-        def predict(self, X):
-            # include negative value to ensure clamping to 0-100 is not needed here
-            return [75.0]
-
-    main_module.model = PredictModel()
+def test_predict_blocks_returns_ranked_candidates_within_radius(client):
     payload = {
-        "hour": 18,
-        "day_of_week": 4,
-        "month": 9,
-        "neighborhood": "mission",
-        "total_spaces": 40,
-        "is_raining": 0,
-        "has_nearby_event": 1,
-        "is_holiday": 0,
-        "is_school_day": 1,
-        "temperature": 65.0,
+        "lat": 37.7816, "lon": -122.3975,
+        "radius_meters": 1500, "hour": 18, "day_of_week": 4, "month": 4,
+        "is_raining": 0, "has_nearby_event": 0,
+        "is_holiday": 0, "is_school_day": 1, "temperature": 62.0,
+        "minutes_away": 0,
     }
-    resp = client.post("/predict", json=payload)
+    resp = client.post("/predict/blocks", json=payload)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["predicted_occupancy_pct"] == 75.0
-    assert body["available_spaces_estimate"] == 10  # 40 * (1 - 0.75)
-    assert body["demand_level"] == "High"
-    assert "recommendation" in body
+
+    assert body["destination_lat"] == payload["lat"]
+    assert body["radius_meters"] == 1500
+    assert body["total_blocks_found"] == 2
+    returned_blocks = body["blocks"]
+    assert len(returned_blocks) == 2
+
+    distances = [b["distance_meters"] for b in returned_blocks]
+    assert distances == sorted(distances)
+
+    required_keys = {
+        "block_id", "street", "lat", "lon", "total_spaces", "neighborhood",
+        "distance_meters", "predicted_occupancy_pct",
+        "available_spaces_estimate", "demand_level", "color",
+    }
+    for b in returned_blocks:
+        assert required_keys <= set(b.keys())
+
+    first = returned_blocks[0]
+    assert first["predicted_occupancy_pct"] == pytest.approx(70.0, abs=0.01)
+    assert first["demand_level"] == "High"
+    assert first["color"] == "#f97316"
+    assert first["available_spaces_estimate"] == int(round(42 * 0.30))
 
 
-def test_predict_returns_service_unavailable_when_model_missing(client, main_module):
+def test_predict_blocks_falls_back_to_nearest_when_radius_empty(client):
+    payload = {
+        "lat": 37.0, "lon": -121.0,
+        "radius_meters": 100, "hour": 12, "day_of_week": 2, "month": 4,
+        "is_raining": 0, "has_nearby_event": 0,
+        "is_holiday": 0, "is_school_day": 1, "temperature": 62.0,
+        "minutes_away": 0,
+    }
+    resp = client.post("/predict/blocks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_blocks_found"] == 3
+
+
+def test_predict_blocks_503_when_model_missing(client, main_module):
     main_module.model = None
     payload = {
-        "hour": 10,
-        "day_of_week": 1,
-        "month": 1,
-        "neighborhood": "mission",
-        "total_spaces": 20,
-        "is_raining": 0,
-        "has_nearby_event": 0,
-        "is_holiday": 0,
-        "is_school_day": 1,
-        "temperature": 60.0,
+        "lat": 37.7816, "lon": -122.3975,
+        "radius_meters": 500, "hour": 10, "day_of_week": 1, "month": 1,
+        "is_raining": 0, "has_nearby_event": 0,
+        "is_holiday": 0, "is_school_day": 1, "temperature": 60.0,
+        "minutes_away": 0,
     }
-    resp = client.post("/predict", json=payload)
+    resp = client.post("/predict/blocks", json=payload)
     assert resp.status_code == 503
-    assert "Model not loaded" in resp.json()["detail"]

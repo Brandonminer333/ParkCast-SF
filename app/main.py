@@ -1,238 +1,385 @@
 """
 ParkCast SF — FastAPI Service
-Serves parking occupancy predictions from the best trained model.
 
-Endpoints:
-  GET  /              → welcome message
-  GET  /health        → model health check
-  POST /predict       → predict single neighborhood occupancy
-  POST /predict/blocks → predict block-by-block around a lat/lng location
+Serves the parkcast-frontend UI (https://parkcast-frontend.vercel.app).
+
+Public endpoints:
+  GET  /                  → welcome / endpoint map
+  GET  /health            → liveness + asset summary
+  POST /predict/blocks    → block-by-block occupancy forecast around a lat/lon
+
+The frontend calls /health on load and /predict/blocks when the user taps
+"Find Parking". Everything else the browser needs (geocoding, routing,
+weather) is fetched directly from third-party services (Nominatim/OSRM/
+Open-Meteo) and does not go through this API.
+
+The prediction stack is the hybrid LightGBM model trained in
+dev/train_lightgbm.ipynb. At inference:
+
+  final_occupancy = clip(block_hour_dow_mean + LightGBM_residual, 0, 100)
+
+where `block_hour_dow_mean` is a per-block historical baseline and the
+LightGBM residual is learned over SFpark meter-hour data. Weather is
+pulled from Open-Meteo on demand, cached by day.
 """
 
+from __future__ import annotations
+
+import json
+import math
 import os
+import urllib.request
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
+from functools import lru_cache
+from typing import List, Optional
+
 import joblib
 import numpy as np
-import math
-import requests
-import logging
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List
 
-# ── Setup logging ──────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────
-import mlflow.sklearn
+# ── Paths ────────────────────────────────────────────────────────────────────
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(APP_DIR, "models")
+DATA_DIR = os.path.join(os.path.dirname(APP_DIR), "data")
 
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://34.133.160.231:5000")
-MODEL_NAME = "parkcast-occupancy-model"
-mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+MODEL_PATH = os.path.join(MODEL_DIR, "LightGBM.pkl")
+BLOCK_AGG_PATH = os.path.join(MODEL_DIR, "LightGBM.block_aggs.parquet")
+BLOCKS_PATH = os.path.join(MODEL_DIR, "blocks.parquet")
+MASTER_PATH = os.path.join(MODEL_DIR, "master_blocks.parquet")
+LAG_PATH = os.path.join(MODEL_DIR, "lag_history.parquet")
+CIT_LOOKUP_PATH = os.path.join(MODEL_DIR, "citations_hourly_median.parquet")
+META_PATH = os.path.join(MODEL_DIR, "LightGBM.meta.json")
+EVENTS_PATH = os.path.join(DATA_DIR, "events.csv")
 
+
+# ── Feature schema (must stay in sync with dev/train_lightgbm.ipynb) ─────────
+FEATURES_NUMERIC = [
+    "hour", "day_of_week", "month", "is_weekend", "is_holiday",
+    "is_school_day", "is_raining", "temperature", "event_intensity",
+    "citation_count", "citations_hourly_median",
+    "lat", "lon", "total_spaces",
+    "block_mean", "block_hour_mean",
+    "lag_7d", "lag_14d", "lag_28d",
+]
+FEATURES_CATEGORICAL = ["neighborhood"]
+FEATURES = FEATURES_NUMERIC + FEATURES_CATEGORICAL
+
+US_HOLIDAYS = {
+    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 5, 26),
+    date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1), date(2025, 10, 13),
+    date(2025, 11, 11), date(2025, 11, 27), date(2025, 12, 25),
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 5, 25),
+    date(2026, 6, 19), date(2026, 7, 4), date(2026, 9, 7), date(2026, 10, 12),
+    date(2026, 11, 11), date(2026, 11, 26), date(2026, 12, 25),
+}
+
+
+# ── Globals populated at startup ─────────────────────────────────────────────
 model = None
+block_aggs: Optional[pd.DataFrame] = None
+blocks: Optional[pd.DataFrame] = None
+master: Optional[pd.DataFrame] = None
+lag_hist: Optional[pd.DataFrame] = None
+cit_lookup: Optional[pd.DataFrame] = None
+events: Optional[pd.DataFrame] = None
+meta: dict = {}
+global_baseline_mean: float = 50.0
 
-def load_model():
-    global model
-    try:
-        model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@champion")
-        logger.info(f"✅ Model loaded from MLflow registry: {MODEL_NAME}@champion")
-    except Exception as e:
-        logger.error(f"❌ MLflow load failed: {e}")
-        try:
-            model = joblib.load("models/RandomForest.pkl")
-            logger.info("✅ Loaded fallback local model")
-        except Exception as e2:
-            logger.error(f"❌ Fallback failed: {e2}")
-            model = None
 
-# ── FastAPI app ───────────────────────────────────────────────
+def _load_all() -> None:
+    """Load model + lookup tables into module globals. Missing optional assets
+    (events, master catalog) degrade gracefully; missing required assets
+    leave `model` as None and /health will report 503."""
+    global model, block_aggs, blocks, master, lag_hist, cit_lookup, events
+    global meta, global_baseline_mean
+
+    model = joblib.load(MODEL_PATH)
+    block_aggs = pd.read_parquet(BLOCK_AGG_PATH)
+    blocks = pd.read_parquet(BLOCKS_PATH)
+    lag_hist = (pd.read_parquet(LAG_PATH)
+                  .sort_values(["lat", "lon", "timestamp"])
+                  .reset_index(drop=True))
+    cit_lookup = pd.read_parquet(CIT_LOOKUP_PATH)
+
+    if os.path.exists(MASTER_PATH):
+        master = pd.read_parquet(MASTER_PATH)
+
+    if os.path.exists(EVENTS_PATH):
+        events = pd.read_csv(EVENTS_PATH, parse_dates=["date"])
+    else:
+        events = pd.DataFrame(columns=["date", "venue_lat", "venue_lon",
+                                       "start_hour", "end_hour"])
+
+    if os.path.exists(META_PATH):
+        with open(META_PATH) as f:
+            meta = json.load(f)
+            global_baseline_mean = float(meta.get("global_mean", 50.0))
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _load_all()
+    yield
+
+
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="ParkCast SF API",
-    description="Predicts parking availability in San Francisco 30-60 minutes ahead.",
+    description="Block-by-block parking occupancy forecasts for San Francisco.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-load_model()
 
-# ── Feature order must match training ─────────────────────────
-FEATURE_ORDER = [
-    "hour", "day_of_week", "month", "is_weekend", "is_rush_hour",
-    "is_street_cleaning", "has_nearby_event", "is_holiday",
-    "is_school_day", "is_raining", "bad_weather", "temperature",
-    "total_spaces", "neighborhood_encoded",
-]
-
-# Neighborhood encoding
-NEIGHBORHOOD_MAP = {
-    "castro": 0, "haight": 1, "marina": 2, "mission": 3,
-    "noe valley": 4, "richmond": 5, "soma": 6, "sunset": 7,
-    "tenderloin": 8, "unknown": 9,
-}
-
-# ── SF Parking blocks database ────────────────────────────────
-# Real SFpark block data: block_id, street, lat, lon, total_spaces, neighborhood
-# In production this would come from the SFpark API or a database
-SF_PARKING_BLOCKS = [
-    # ── SoMa ──────────────────────────────────────────────────
-    {"block_id":"soma_001","street":"Folsom St (3rd-4th)","lat":37.7816,"lon":-122.3975,"total_spaces":42,"neighborhood":"soma"},
-    {"block_id":"soma_002","street":"Howard St (3rd-4th)","lat":37.7820,"lon":-122.3968,"total_spaces":38,"neighborhood":"soma"},
-    {"block_id":"soma_003","street":"Brannan St (4th-5th)","lat":37.7792,"lon":-122.3952,"total_spaces":35,"neighborhood":"soma"},
-    {"block_id":"soma_004","street":"Folsom St (4th-5th)","lat":37.7814,"lon":-122.3948,"total_spaces":44,"neighborhood":"soma"},
-    {"block_id":"soma_005","street":"Howard St (4th-5th)","lat":37.7818,"lon":-122.3942,"total_spaces":40,"neighborhood":"soma"},
-    {"block_id":"soma_006","street":"Minna St (4th-5th)","lat":37.7822,"lon":-122.3938,"total_spaces":28,"neighborhood":"soma"},
-    {"block_id":"soma_007","street":"Natoma St (3rd-4th)","lat":37.7826,"lon":-122.3972,"total_spaces":25,"neighborhood":"soma"},
-    {"block_id":"soma_008","street":"Clementina St (3rd-4th)","lat":37.7830,"lon":-122.3980,"total_spaces":22,"neighborhood":"soma"},
-    {"block_id":"soma_009","street":"Harrison St (3rd-4th)","lat":37.7808,"lon":-122.3972,"total_spaces":36,"neighborhood":"soma"},
-    {"block_id":"soma_010","street":"Bryant St (4th-5th)","lat":37.7800,"lon":-122.3955,"total_spaces":40,"neighborhood":"soma"},
-    {"block_id":"soma_011","street":"Folsom St (5th-6th)","lat":37.7812,"lon":-122.4010,"total_spaces":38,"neighborhood":"soma"},
-    {"block_id":"soma_012","street":"Howard St (5th-6th)","lat":37.7816,"lon":-122.4018,"total_spaces":36,"neighborhood":"soma"},
-    {"block_id":"soma_013","street":"Tehama St (5th-6th)","lat":37.7820,"lon":-122.4022,"total_spaces":24,"neighborhood":"soma"},
-    {"block_id":"soma_014","street":"Folsom St (6th-7th)","lat":37.7810,"lon":-122.4038,"total_spaces":40,"neighborhood":"soma"},
-    {"block_id":"soma_015","street":"Howard St (6th-7th)","lat":37.7814,"lon":-122.4042,"total_spaces":38,"neighborhood":"soma"},
-    # ── Mission ───────────────────────────────────────────────
-    {"block_id":"miss_001","street":"Valencia St (16th-17th)","lat":37.7645,"lon":-122.4211,"total_spaces":48,"neighborhood":"mission"},
-    {"block_id":"miss_002","street":"Valencia St (17th-18th)","lat":37.7634,"lon":-122.4213,"total_spaces":46,"neighborhood":"mission"},
-    {"block_id":"miss_003","street":"Mission St (16th-17th)","lat":37.7648,"lon":-122.4192,"total_spaces":52,"neighborhood":"mission"},
-    {"block_id":"miss_004","street":"Mission St (17th-18th)","lat":37.7637,"lon":-122.4195,"total_spaces":50,"neighborhood":"mission"},
-    {"block_id":"miss_005","street":"Guerrero St (16th-17th)","lat":37.7646,"lon":-122.4228,"total_spaces":36,"neighborhood":"mission"},
-    {"block_id":"miss_006","street":"Dolores St (16th-17th)","lat":37.7644,"lon":-122.4245,"total_spaces":32,"neighborhood":"mission"},
-    {"block_id":"miss_007","street":"18th St (Valencia-Guerrero)","lat":37.7620,"lon":-122.4222,"total_spaces":38,"neighborhood":"mission"},
-    {"block_id":"miss_008","street":"24th St (Mission-Valencia)","lat":37.7525,"lon":-122.4188,"total_spaces":44,"neighborhood":"mission"},
-    {"block_id":"miss_009","street":"Valencia St (18th-19th)","lat":37.7623,"lon":-122.4215,"total_spaces":44,"neighborhood":"mission"},
-    {"block_id":"miss_010","street":"Valencia St (19th-20th)","lat":37.7612,"lon":-122.4217,"total_spaces":42,"neighborhood":"mission"},
-    {"block_id":"miss_011","street":"Mission St (24th-25th)","lat":37.7524,"lon":-122.4182,"total_spaces":48,"neighborhood":"mission"},
-    {"block_id":"miss_012","street":"24th St (Valencia-Guerrero)","lat":37.7524,"lon":-122.4210,"total_spaces":40,"neighborhood":"mission"},
-    {"block_id":"miss_013","street":"20th St (Mission-Valencia)","lat":37.7592,"lon":-122.4188,"total_spaces":36,"neighborhood":"mission"},
-    {"block_id":"miss_014","street":"22nd St (Mission-Valencia)","lat":37.7558,"lon":-122.4188,"total_spaces":38,"neighborhood":"mission"},
-    # ── Castro ────────────────────────────────────────────────
-    {"block_id":"cast_001","street":"Castro St (18th-19th)","lat":37.7608,"lon":-122.4350,"total_spaces":30,"neighborhood":"castro"},
-    {"block_id":"cast_002","street":"Market St (Castro-Noe)","lat":37.7614,"lon":-122.4339,"total_spaces":35,"neighborhood":"castro"},
-    {"block_id":"cast_003","street":"18th St (Castro-Collingwood)","lat":37.7601,"lon":-122.4355,"total_spaces":28,"neighborhood":"castro"},
-    {"block_id":"cast_004","street":"19th St (Castro-Collingwood)","lat":37.7589,"lon":-122.4356,"total_spaces":26,"neighborhood":"castro"},
-    {"block_id":"cast_005","street":"Castro St (17th-18th)","lat":37.7620,"lon":-122.4348,"total_spaces":32,"neighborhood":"castro"},
-    {"block_id":"cast_006","street":"17th St (Castro-Noe)","lat":37.7622,"lon":-122.4338,"total_spaces":30,"neighborhood":"castro"},
-    {"block_id":"cast_007","street":"Noe St (17th-18th)","lat":37.7612,"lon":-122.4328,"total_spaces":28,"neighborhood":"castro"},
-    # ── Marina ────────────────────────────────────────────────
-    {"block_id":"mari_001","street":"Chestnut St (Fillmore-Steiner)","lat":37.8004,"lon":-122.4370,"total_spaces":40,"neighborhood":"marina"},
-    {"block_id":"mari_002","street":"Chestnut St (Steiner-Pierce)","lat":37.8003,"lon":-122.4390,"total_spaces":38,"neighborhood":"marina"},
-    {"block_id":"mari_003","street":"Union St (Fillmore-Steiner)","lat":37.7984,"lon":-122.4368,"total_spaces":42,"neighborhood":"marina"},
-    {"block_id":"mari_004","street":"Lombard St (Fillmore-Steiner)","lat":37.7997,"lon":-122.4372,"total_spaces":36,"neighborhood":"marina"},
-    {"block_id":"mari_005","street":"Chestnut St (Pierce-Scott)","lat":37.8002,"lon":-122.4410,"total_spaces":36,"neighborhood":"marina"},
-    {"block_id":"mari_006","street":"Union St (Steiner-Pierce)","lat":37.7983,"lon":-122.4388,"total_spaces":40,"neighborhood":"marina"},
-    {"block_id":"mari_007","street":"Fillmore St (Chestnut-Lombard)","lat":37.7993,"lon":-122.4360,"total_spaces":34,"neighborhood":"marina"},
-    # ── Haight ────────────────────────────────────────────────
-    {"block_id":"haig_001","street":"Haight St (Masonic-Ashbury)","lat":37.7694,"lon":-122.4462,"total_spaces":34,"neighborhood":"haight"},
-    {"block_id":"haig_002","street":"Haight St (Ashbury-Clayton)","lat":37.7693,"lon":-122.4482,"total_spaces":32,"neighborhood":"haight"},
-    {"block_id":"haig_003","street":"Haight St (Clayton-Cole)","lat":37.7692,"lon":-122.4500,"total_spaces":30,"neighborhood":"haight"},
-    {"block_id":"haig_004","street":"Haight St (Cole-Shrader)","lat":37.7691,"lon":-122.4518,"total_spaces":28,"neighborhood":"haight"},
-    {"block_id":"haig_005","street":"Masonic Ave (Haight-Page)","lat":37.7706,"lon":-122.4455,"total_spaces":30,"neighborhood":"haight"},
-    {"block_id":"haig_006","street":"Page St (Masonic-Ashbury)","lat":37.7706,"lon":-122.4462,"total_spaces":28,"neighborhood":"haight"},
-    # ── Richmond ──────────────────────────────────────────────
-    {"block_id":"rich_001","street":"Clement St (2nd-3rd Ave)","lat":37.7830,"lon":-122.4638,"total_spaces":44,"neighborhood":"richmond"},
-    {"block_id":"rich_002","street":"Clement St (3rd-4th Ave)","lat":37.7830,"lon":-122.4658,"total_spaces":42,"neighborhood":"richmond"},
-    {"block_id":"rich_003","street":"Geary Blvd (3rd-4th Ave)","lat":37.7806,"lon":-122.4652,"total_spaces":50,"neighborhood":"richmond"},
-    {"block_id":"rich_004","street":"Clement St (4th-5th Ave)","lat":37.7830,"lon":-122.4678,"total_spaces":40,"neighborhood":"richmond"},
-    {"block_id":"rich_005","street":"Clement St (5th-6th Ave)","lat":37.7830,"lon":-122.4698,"total_spaces":38,"neighborhood":"richmond"},
-    {"block_id":"rich_006","street":"Geary Blvd (4th-5th Ave)","lat":37.7806,"lon":-122.4672,"total_spaces":48,"neighborhood":"richmond"},
-    {"block_id":"rich_007","street":"Balboa St (3rd-4th Ave)","lat":37.7760,"lon":-122.4658,"total_spaces":36,"neighborhood":"richmond"},
-    # ── Tenderloin ────────────────────────────────────────────
-    {"block_id":"tend_001","street":"Turk St (Hyde-Leavenworth)","lat":37.7836,"lon":-122.4148,"total_spaces":30,"neighborhood":"tenderloin"},
-    {"block_id":"tend_002","street":"Ellis St (Hyde-Leavenworth)","lat":37.7845,"lon":-122.4148,"total_spaces":28,"neighborhood":"tenderloin"},
-    {"block_id":"tend_003","street":"O'Farrell St (Hyde-Leavenworth)","lat":37.7856,"lon":-122.4148,"total_spaces":32,"neighborhood":"tenderloin"},
-    {"block_id":"tend_004","street":"Eddy St (Hyde-Leavenworth)","lat":37.7827,"lon":-122.4148,"total_spaces":26,"neighborhood":"tenderloin"},
-    {"block_id":"tend_005","street":"Jones St (Turk-Ellis)","lat":37.7840,"lon":-122.4134,"total_spaces":24,"neighborhood":"tenderloin"},
-    # ── Downtown / Union Square ───────────────────────────────
-    {"block_id":"down_001","street":"Post St (Powell-Stockton)","lat":37.7882,"lon":-122.4075,"total_spaces":30,"neighborhood":"tenderloin"},
-    {"block_id":"down_002","street":"Geary St (Powell-Stockton)","lat":37.7874,"lon":-122.4075,"total_spaces":32,"neighborhood":"tenderloin"},
-    {"block_id":"down_003","street":"Sutter St (Powell-Stockton)","lat":37.7890,"lon":-122.4075,"total_spaces":28,"neighborhood":"tenderloin"},
-    {"block_id":"down_004","street":"Post St (Stockton-Grant)","lat":37.7882,"lon":-122.4060,"total_spaces":26,"neighborhood":"tenderloin"},
-    {"block_id":"down_005","street":"O'Farrell St (Powell-Stockton)","lat":37.7865,"lon":-122.4075,"total_spaces":30,"neighborhood":"tenderloin"},
-    # ── Noe Valley ────────────────────────────────────────────
-    {"block_id":"noev_001","street":"24th St (Noe-Sanchez)","lat":37.7502,"lon":-122.4298,"total_spaces":36,"neighborhood":"noe valley"},
-    {"block_id":"noev_002","street":"24th St (Sanchez-Church)","lat":37.7502,"lon":-122.4318,"total_spaces":34,"neighborhood":"noe valley"},
-    {"block_id":"noev_003","street":"Church St (24th-25th)","lat":37.7492,"lon":-122.4285,"total_spaces":32,"neighborhood":"noe valley"},
-    {"block_id":"noev_004","street":"Noe St (24th-25th)","lat":37.7492,"lon":-122.4308,"total_spaces":28,"neighborhood":"noe valley"},
-    {"block_id":"noev_005","street":"24th St (Church-Sanchez)","lat":37.7502,"lon":-122.4270,"total_spaces":38,"neighborhood":"noe valley"},
-    # ── Sunset ────────────────────────────────────────────────
-    {"block_id":"suns_001","street":"Irving St (7th-8th Ave)","lat":37.7644,"lon":-122.4637,"total_spaces":40,"neighborhood":"sunset"},
-    {"block_id":"suns_002","street":"Irving St (8th-9th Ave)","lat":37.7644,"lon":-122.4657,"total_spaces":38,"neighborhood":"sunset"},
-    {"block_id":"suns_003","street":"Irving St (9th-10th Ave)","lat":37.7644,"lon":-122.4677,"total_spaces":36,"neighborhood":"sunset"},
-    {"block_id":"suns_004","street":"Judah St (7th-8th Ave)","lat":37.7624,"lon":-122.4637,"total_spaces":34,"neighborhood":"sunset"},
-    {"block_id":"suns_005","street":"Noriega St (7th-8th Ave)","lat":37.7539,"lon":-122.4637,"total_spaces":38,"neighborhood":"sunset"},
-    # ── North Beach / Fishermans Wharf ────────────────────────
-    {"block_id":"nobe_001","street":"Columbus Ave (Broadway-Vallejo)","lat":37.7990,"lon":-122.4070,"total_spaces":30,"neighborhood":"unknown"},
-    {"block_id":"nobe_002","street":"Green St (Columbus-Grant)","lat":37.7985,"lon":-122.4055,"total_spaces":28,"neighborhood":"unknown"},
-    {"block_id":"nobe_003","street":"Vallejo St (Columbus-Grant)","lat":37.7993,"lon":-122.4055,"total_spaces":26,"neighborhood":"unknown"},
-    {"block_id":"nobe_004","street":"Columbus Ave (Vallejo-Green)","lat":37.7985,"lon":-122.4068,"total_spaces":32,"neighborhood":"unknown"},
-    # ── Civic Center / Hayes Valley ───────────────────────────
-    {"block_id":"civi_001","street":"Hayes St (Octavia-Laguna)","lat":37.7764,"lon":-122.4238,"total_spaces":34,"neighborhood":"unknown"},
-    {"block_id":"civi_002","street":"Hayes St (Laguna-Buchanan)","lat":37.7764,"lon":-122.4258,"total_spaces":32,"neighborhood":"unknown"},
-    {"block_id":"civi_003","street":"Gough St (Hayes-Fell)","lat":37.7758,"lon":-122.4228,"total_spaces":30,"neighborhood":"unknown"},
-    {"block_id":"civi_004","street":"Fell St (Octavia-Laguna)","lat":37.7752,"lon":-122.4238,"total_spaces":28,"neighborhood":"unknown"},
-    {"block_id":"civi_005","street":"Van Ness Ave (Hayes-Grove)","lat":37.7766,"lon":-122.4195,"total_spaces":36,"neighborhood":"unknown"},
-    {"block_id":"civi_006","street":"Grove St (Van Ness-Polk)","lat":37.7772,"lon":-122.4188,"total_spaces":30,"neighborhood":"unknown"},
-    # ── Potrero Hill ──────────────────────────────────────────
-    {"block_id":"potr_001","street":"18th St (Connecticut-Missouri)","lat":37.7622,"lon":-122.4038,"total_spaces":32,"neighborhood":"soma"},
-    {"block_id":"potr_002","street":"20th St (Connecticut-Missouri)","lat":37.7592,"lon":-122.4038,"total_spaces":30,"neighborhood":"soma"},
-    {"block_id":"potr_003","street":"Connecticut St (18th-20th)","lat":37.7607,"lon":-122.4045,"total_spaces":28,"neighborhood":"soma"},
-    # ── Japantown / Western Addition ──────────────────────────
-    {"block_id":"japa_001","street":"Post St (Buchanan-Webster)","lat":37.7852,"lon":-122.4308,"total_spaces":36,"neighborhood":"unknown"},
-    {"block_id":"japa_002","street":"Buchanan St (Post-Sutter)","lat":37.7858,"lon":-122.4318,"total_spaces":32,"neighborhood":"unknown"},
-    {"block_id":"japa_003","street":"Webster St (Post-Sutter)","lat":37.7858,"lon":-122.4298,"total_spaces":30,"neighborhood":"unknown"},
-    {"block_id":"japa_004","street":"Fillmore St (Post-Sutter)","lat":37.7858,"lon":-122.4330,"total_spaces":34,"neighborhood":"unknown"},
-    # ── Bernal Heights ────────────────────────────────────────
-    {"block_id":"bern_001","street":"Cortland Ave (Bennington-Moultrie)","lat":37.7396,"lon":-122.4168,"total_spaces":30,"neighborhood":"unknown"},
-    {"block_id":"bern_002","street":"Cortland Ave (Moultrie-Folsom)","lat":37.7396,"lon":-122.4148,"total_spaces":28,"neighborhood":"unknown"},
-    # ── Dogpatch ──────────────────────────────────────────────
-    {"block_id":"dogp_001","street":"3rd St (22nd-23rd)","lat":37.7578,"lon":-122.3888,"total_spaces":34,"neighborhood":"soma"},
-    {"block_id":"dogp_002","street":"Illinois St (22nd-23rd)","lat":37.7578,"lon":-122.3875,"total_spaces":30,"neighborhood":"soma"},
-    {"block_id":"dogp_003","street":"Tennessee St (22nd-23rd)","lat":37.7578,"lon":-122.3862,"total_spaces":28,"neighborhood":"soma"},
-    # ── Inner Sunset ──────────────────────────────────────────
-    {"block_id":"insu_001","street":"9th Ave (Irving-Judah)","lat":37.7634,"lon":-122.4658,"total_spaces":32,"neighborhood":"sunset"},
-    {"block_id":"insu_002","street":"9th Ave (Judah-Kirkham)","lat":37.7614,"lon":-122.4658,"total_spaces":30,"neighborhood":"sunset"},
-    {"block_id":"insu_003","street":"Lincoln Way (9th-10th Ave)","lat":37.7668,"lon":-122.4660,"total_spaces":28,"neighborhood":"sunset"},
-]
+# ── Weather: on-demand Open-Meteo with daily cache ───────────────────────────
+@lru_cache(maxsize=256)
+def _weather_day(day_iso: str) -> Optional[dict]:
+    """SF hourly temperature (°F) + precipitation for `day_iso`.
+    Returns {hour: (temp_f, is_raining)} or None on failure."""
+    url = (
+        "https://api.open-meteo.com/v1/forecast?"
+        "latitude=37.7749&longitude=-122.4194"
+        f"&start_date={day_iso}&end_date={day_iso}"
+        "&hourly=temperature_2m,precipitation"
+        "&temperature_unit=fahrenheit"
+        "&timezone=America/Los_Angeles"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            data = json.load(r)
+        hours = [datetime.fromisoformat(t).hour for t in data["hourly"]["time"]]
+        temps = data["hourly"]["temperature_2m"]
+        precip = data["hourly"]["precipitation"]
+        return {h: (float(t), 1 if (p or 0) > 0.1 else 0)
+                for h, t, p in zip(hours, temps, precip)}
+    except Exception:
+        return None
 
 
-
-# ── Pydantic models ───────────────────────────────────────────
-
-class ParkingInput(BaseModel):
-    hour: int = Field(..., ge=0, le=23)
-    day_of_week: int = Field(..., ge=0, le=6)
-    month: int = Field(..., ge=1, le=12)
-    neighborhood: str = Field(...)
-    total_spaces: int = Field(..., ge=1)
-    is_raining: int = Field(0, ge=0, le=1)
-    has_nearby_event: int = Field(0, ge=0, le=1)
-    is_holiday: int = Field(0, ge=0, le=1)
-    is_school_day: int = Field(1, ge=0, le=1)
-    temperature: float = Field(60.0)
-
-    class Config:
-        json_schema_extra = {"example": {
-            "hour": 19, "day_of_week": 4, "month": 4,
-            "neighborhood": "mission", "total_spaces": 45,
-            "is_raining": 0, "has_nearby_event": 1,
-            "is_holiday": 0, "is_school_day": 1, "temperature": 62.5
-        }}
+def weather_for(ts: datetime) -> tuple[float, int]:
+    day_data = _weather_day(ts.date().isoformat())
+    if day_data and ts.hour in day_data:
+        return day_data[ts.hour]
+    return 60.0, 0
 
 
+# ── Geo helpers ──────────────────────────────────────────────────────────────
+def haversine_vec(lat1: float, lon1: float,
+                  lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+    """Vectorized haversine distance in meters, scalar origin → array dest."""
+    R = 6_371_000
+    lat1r = math.radians(lat1)
+    lat2r = np.radians(lat2)
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = (np.sin(dlat / 2) ** 2
+         + math.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2)
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+
+# ── Feature engineering ──────────────────────────────────────────────────────
+def is_school_day(d: date) -> int:
+    """Rough SF school-year heuristic: weekdays, Sep–May, not a US holiday."""
+    if d.weekday() >= 5 or d in US_HOLIDAYS:
+        return 0
+    if d.month in (6, 7, 8):
+        return 0
+    return 1
+
+
+def event_intensity_at(lat: float, lon: float, ts: datetime,
+                       radius_m: float = 800.0) -> float:
+    """max(exp(-dist_m / 300)) over active events within `radius_m`. Matches
+    the encoding used during training (see dev/preprocess_real_data.ipynb)."""
+    if events is None or events.empty:
+        return 0.0
+    same_day = events[events["date"].dt.date == ts.date()]
+    if same_day.empty:
+        return 0.0
+    in_window = same_day[(same_day["start_hour"] <= ts.hour)
+                         & (ts.hour <= same_day["end_hour"])]
+    if in_window.empty:
+        return 0.0
+    dists = haversine_vec(lat, lon,
+                          in_window["venue_lat"].values,
+                          in_window["venue_lon"].values)
+    close = dists <= radius_m
+    if not close.any():
+        return 0.0
+    return float(np.exp(-dists[close] / 300.0).max())
+
+
+def lag_value(lat: float, lon: float, ts: datetime, days: int) -> float:
+    target = ts - timedelta(days=days)
+    mask = ((lag_hist["lat"] == lat)
+            & (lag_hist["lon"] == lon)
+            & (lag_hist["timestamp"] == target))
+    hit = lag_hist.loc[mask, "occupancy_pct"]
+    return float(hit.iloc[0]) if len(hit) else np.nan
+
+
+def block_aggregates_for(lat: float, lon: float, hour: int, dow: int
+                         ) -> tuple[float, float, float]:
+    """(block_mean, block_hour_mean, block_hour_dow_mean) with progressive
+    fallbacks. block_hour_dow_mean is the additive baseline the residual
+    LightGBM was trained against."""
+    exact = block_aggs[
+        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)
+        & (block_aggs["hour"] == hour) & (block_aggs["day_of_week"] == dow)
+    ]
+    if len(exact):
+        r = exact.iloc[0]
+        return (float(r["block_mean"]), float(r["block_hour_mean"]),
+                float(r["block_hour_dow_mean"]))
+
+    hour_only = block_aggs[
+        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)
+        & (block_aggs["hour"] == hour)
+    ]
+    if len(hour_only):
+        bhm = float(hour_only["block_hour_mean"].iloc[0])
+        bm = float(hour_only["block_mean"].iloc[0])
+        return bm, bhm, bhm
+
+    block_only = block_aggs[
+        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)
+    ]
+    if len(block_only):
+        bm = float(block_only["block_mean"].iloc[0])
+        return bm, bm, bm
+
+    gm = global_baseline_mean
+    return gm, gm, gm
+
+
+def citations_median(hour: int, dow: int) -> float:
+    row = cit_lookup[
+        (cit_lookup["hour"] == hour) & (cit_lookup["day_of_week"] == dow)
+    ]
+    return float(row["citations_hourly_median"].iloc[0]) if len(row) else 0.0
+
+
+def build_feature_row(block_row: pd.Series, ts: datetime,
+                      temp_f: float, raining: int) -> dict:
+    lat = float(block_row["lat"])
+    lon = float(block_row["lon"])
+    hour = ts.hour
+    dow = ts.weekday()
+    bm, bhm, baseline = block_aggregates_for(lat, lon, hour, dow)
+    return {
+        "hour": hour,
+        "day_of_week": dow,
+        "month": ts.month,
+        "is_weekend": 1 if dow >= 5 else 0,
+        "is_holiday": 1 if ts.date() in US_HOLIDAYS else 0,
+        "is_school_day": is_school_day(ts.date()),
+        "is_raining": raining,
+        "temperature": temp_f,
+        "event_intensity": event_intensity_at(lat, lon, ts),
+        "citation_count": 0.0,
+        "citations_hourly_median": citations_median(hour, dow),
+        "lat": lat,
+        "lon": lon,
+        "total_spaces": int(block_row["total_spaces"]),
+        "block_mean": bm,
+        "block_hour_mean": bhm,
+        "lag_7d": lag_value(lat, lon, ts, 7),
+        "lag_14d": lag_value(lat, lon, ts, 14),
+        "lag_28d": lag_value(lat, lon, ts, 28),
+        "neighborhood": str(block_row["neighborhood"]),
+        "_baseline": baseline,
+    }
+
+
+def score_blocks(block_df: pd.DataFrame, ts: datetime) -> pd.DataFrame:
+    """Run the residual LightGBM and add occupancy + available-spaces columns.
+    Residual is added to block_hour_dow_mean baseline (see train_lightgbm)."""
+    temp_f, raining = weather_for(ts)
+    rows = [build_feature_row(r, ts, temp_f, raining)
+            for _, r in block_df.iterrows()]
+    feat = pd.DataFrame(rows)
+    baselines = feat.pop("_baseline").values
+    feat["neighborhood"] = feat["neighborhood"].astype("category")
+    for col in FEATURES_NUMERIC:
+        feat[col] = pd.to_numeric(feat[col], errors="coerce")
+
+    residual = model.predict(feat[FEATURES])
+    occupancy = np.clip(baselines + residual, 0, 100)
+
+    out = block_df.copy().reset_index(drop=True)
+    out["predicted_occupancy_pct"] = occupancy.round(2)
+    out["available_spaces"] = (out["total_spaces"]
+                               * (1 - occupancy / 100)).round().astype(int)
+    return out
+
+
+# ── Response classification ──────────────────────────────────────────────────
+def demand_level(pct: float) -> str:
+    if pct < 40:
+        return "Low"
+    if pct < 70:
+        return "Medium"
+    if pct < 85:
+        return "High"
+    return "Very High"
+
+
+def color_for(pct: float) -> str:
+    """Hex color used by the frontend map markers. Matches the UI legend."""
+    if pct < 40:
+        return "#22c55e"   # green  — Easy
+    if pct < 70:
+        return "#f59e0b"   # amber  — Moderate
+    if pct < 85:
+        return "#f97316"   # orange — Hard
+    return "#ef4444"       # red    — Very Hard
+
+
+def street_label_for(lat: float, lon: float, neighborhood: str) -> str:
+    """Prefer a human-readable street name from master_blocks if available,
+    otherwise fall back to a neighborhood-tagged label."""
+    if master is not None and not master.empty:
+        candidate_cols = [c for c in ("corridor", "limits") if c in master.columns]
+        if candidate_cols:
+            # Nearest master block within ~80m (street-segment centers can
+            # drift from metered centroids).
+            dists = haversine_vec(lat, lon,
+                                  master["lat"].values, master["lon"].values)
+            nearest = int(np.argmin(dists))
+            if dists[nearest] <= 80.0:
+                for col in candidate_cols:
+                    val = master.iloc[nearest][col]
+                    if pd.notna(val) and str(val).strip():
+                        return str(val).strip()
+    pretty_nbh = neighborhood.replace("_", " ").title() if neighborhood else "Unknown"
+    return f"{pretty_nbh} block"
+
+
+# ── Request / response schemas ───────────────────────────────────────────────
 class BlockPredictionRequest(BaseModel):
-    """Request for block-by-block predictions around a location."""
+    """Matches the POST body sent by parkcast-frontend/app/page.js.
+
+    Most "condition" fields (is_holiday, is_school_day, is_raining, temperature,
+    has_nearby_event) are resolved server-side from the arrival timestamp and
+    Open-Meteo + the events catalog, so the client-supplied values are accepted
+    for backwards compatibility but deliberately ignored — the server's answer
+    stays self-consistent even if the browser's weather fetch failed."""
     lat: float = Field(..., description="Destination latitude")
     lon: float = Field(..., description="Destination longitude")
-    radius_meters: int = Field(500, ge=100, le=2000, description="Search radius in meters")
+    radius_meters: int = Field(1500, ge=100, le=3000)
     hour: int = Field(..., ge=0, le=23)
     day_of_week: int = Field(..., ge=0, le=6)
     month: int = Field(..., ge=1, le=12)
@@ -241,16 +388,7 @@ class BlockPredictionRequest(BaseModel):
     is_holiday: int = Field(0, ge=0, le=1)
     is_school_day: int = Field(1, ge=0, le=1)
     temperature: float = Field(60.0)
-    minutes_away: int = Field(0, ge=0, le=120, description="Minutes until arrival (for future prediction)")
-
-    class Config:
-        json_schema_extra = {"example": {
-            "lat": 37.7816, "lon": -122.3975, "radius_meters": 500,
-            "hour": 19, "day_of_week": 4, "month": 4,
-            "is_raining": 0, "has_nearby_event": 1,
-            "is_holiday": 0, "is_school_day": 1, "temperature": 62.5,
-            "minutes_away": 20
-        }}
+    minutes_away: int = Field(0, ge=0, le=180)
 
 
 class BlockPrediction(BaseModel):
@@ -277,74 +415,7 @@ class BlockPredictionResponse(BaseModel):
     blocks: List[BlockPrediction]
 
 
-class ParkingPrediction(BaseModel):
-    neighborhood: str
-    hour: int
-    day_of_week: int
-    predicted_occupancy_pct: float
-    available_spaces_estimate: int
-    demand_level: str
-    recommendation: str
-    model_version: str = "RandomForest-v1"
-
-    class Config:
-        protected_namespaces = ()
-
-
-# ── Helper functions ──────────────────────────────────────────
-
-def haversine_distance(lat1, lon1, lat2, lon2):
-    """Calculate distance in meters between two lat/lon points."""
-    R = 6371000  # Earth radius in meters
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-
-def get_demand_level(pct):
-    if pct < 40:   return "Low"
-    elif pct < 70: return "Medium"
-    elif pct < 85: return "High"
-    else:          return "Very High"
-
-
-def get_color(pct):
-    """Return hex color for map overlay based on occupancy."""
-    if pct < 40:   return "#22c55e"   # green
-    elif pct < 70: return "#f59e0b"   # amber
-    elif pct < 85: return "#f97316"   # orange
-    else:          return "#ef4444"   # red
-
-
-def get_recommendation(pct):
-    if pct < 40:   return "Easy to park — plenty of spaces available."
-    elif pct < 70: return "Good chance of finding parking — head over."
-    elif pct < 85: return "Limited spots — arrive early or consider nearby blocks."
-    else:          return "Very hard to park — consider public transit or a garage."
-
-
-def prepare_features(hour, day_of_week, month, total_spaces,
-                     neighborhood, is_raining, has_nearby_event,
-                     is_holiday, is_school_day, temperature):
-    is_weekend = 1 if day_of_week >= 5 else 0
-    is_rush_hour = 1 if (7 <= hour <= 9 or 17 <= hour <= 19) else 0
-    is_street_cleaning = 1 if 8 <= hour <= 12 else 0
-    bad_weather = is_raining
-    neighborhood_encoded = NEIGHBORHOOD_MAP.get(
-        neighborhood.lower(), NEIGHBORHOOD_MAP["unknown"]
-    )
-    return np.array([
-        hour, day_of_week, month, is_weekend, is_rush_hour,
-        is_street_cleaning, has_nearby_event, is_holiday,
-        is_school_day, is_raining, bad_weather, temperature,
-        total_spaces, neighborhood_encoded,
-    ]).reshape(1, -1)
-
-
-# ── Endpoints ─────────────────────────────────────────────────
-
+# ── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
@@ -352,133 +423,85 @@ def root():
         "description": "Block-by-block parking prediction for San Francisco",
         "version": "2.0.0",
         "endpoints": {
-            "health":         "GET /health",
-            "predict":        "POST /predict",
+            "health": "GET /health",
             "predict_blocks": "POST /predict/blocks",
-            "docs":           "GET /docs",
-        }
+            "docs": "GET /docs",
+        },
     }
 
 
 @app.get("/health")
 def health():
-    if model is None:
+    if model is None or blocks is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
     return {
         "status": "healthy",
         "model_loaded": True,
         "model_type": type(model).__name__,
-        "num_features": len(FEATURE_ORDER),
-        "total_blocks_in_db": len(SF_PARKING_BLOCKS),
+        "num_features": len(FEATURES),
+        "total_blocks_in_db": int(len(blocks)),
+        "trained_test_mae": meta.get("metrics", {})
+                                 .get("residual_model", {}).get("mae"),
     }
 
 
-@app.post("/predict", response_model=ParkingPrediction)
-def predict(input: ParkingInput):
-    """Predict parking occupancy for a single neighborhood."""
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded.")
-    try:
-        features = prepare_features(
-            input.hour, input.day_of_week, input.month, input.total_spaces,
-            input.neighborhood, input.is_raining, input.has_nearby_event,
-            input.is_holiday, input.is_school_day, input.temperature
-        )
-        pct = float(model.predict(features)[0])
-        pct = round(min(100.0, max(0.0, pct)), 2)
-        available = int(input.total_spaces * (1 - pct / 100))
-        return ParkingPrediction(
-            neighborhood=input.neighborhood,
-            hour=input.hour,
-            day_of_week=input.day_of_week,
-            predicted_occupancy_pct=pct,
-            available_spaces_estimate=available,
-            demand_level=get_demand_level(pct),
-            recommendation=get_recommendation(pct),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
-
-
 @app.post("/predict/blocks", response_model=BlockPredictionResponse)
-def predict_blocks(req: BlockPredictionRequest):
-    """
-    Predict parking occupancy block-by-block around a destination.
-    Returns color-coded predictions for all blocks within radius.
-    """
-    if model is None:
+def predict_blocks_endpoint(req: BlockPredictionRequest):
+    """Rank every metered block within `radius_meters` of (lat, lon) by
+    predicted occupancy at arrival time. If no blocks fall inside the radius,
+    return the 8 closest so the map still has something to render."""
+    if model is None or blocks is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
-    # Adjust hour for arrival time (account for minutes_away)
-    arrival_hour = (req.hour + req.minutes_away // 60) % 24
+    arrival_ts = datetime.now() + timedelta(minutes=req.minutes_away)
+    arrival_hour = arrival_ts.hour
 
-    nearby_blocks = []
-    for block in SF_PARKING_BLOCKS:
-        dist = haversine_distance(req.lat, req.lon, block["lat"], block["lon"])
-        if dist <= req.radius_meters:
+    dists = haversine_vec(req.lat, req.lon,
+                          blocks["lat"].values, blocks["lon"].values)
+    mask = dists <= req.radius_meters
 
-            try:
-                features = prepare_features(
-                    arrival_hour, req.day_of_week, req.month,
-                    block["total_spaces"], block["neighborhood"],
-                    req.is_raining, req.has_nearby_event,
-                    req.is_holiday, req.is_school_day, req.temperature
-                )
-                pct = float(model.predict(features)[0])
-                pct = round(min(100.0, max(0.0, pct)), 2)
-                available = int(block["total_spaces"] * (1 - pct / 100))
+    if mask.any():
+        near = blocks.loc[mask].copy()
+        near_dists = dists[mask]
+    else:
+        nearest_idx = np.argsort(dists)[:8]
+        near = blocks.iloc[nearest_idx].copy()
+        near_dists = dists[nearest_idx]
 
-                nearby_blocks.append(BlockPrediction(
-                    block_id=block["block_id"],
-                    street=block["street"],
-                    lat=block["lat"],
-                    lon=block["lon"],
-                    total_spaces=block["total_spaces"],
-                    neighborhood=block["neighborhood"],
-                    distance_meters=int(dist),
-                    predicted_occupancy_pct=pct,
-                    available_spaces_estimate=available,
-                    demand_level=get_demand_level(pct),
-                    color=get_color(pct),
-                ))
-            except Exception:
-                continue
+    if near.empty:
+        return BlockPredictionResponse(
+            destination_lat=req.lat, destination_lon=req.lon,
+            radius_meters=req.radius_meters, predicted_at_hour=arrival_hour,
+            minutes_away=req.minutes_away, total_blocks_found=0, blocks=[],
+        )
 
-    # Sort by distance
-    nearby_blocks.sort(key=lambda x: x.distance_meters)
+    near = near.reset_index(drop=True)
+    near["distance_m"] = near_dists
 
-    # ── Fallback: if nothing in radius, return 5 nearest blocks ──
-    if not nearby_blocks:
-        all_blocks_with_dist = []
-        for block in SF_PARKING_BLOCKS:
-            dist = haversine_distance(req.lat, req.lon, block["lat"], block["lon"])
-            try:
-                features = prepare_features(
-                    arrival_hour, req.day_of_week, req.month,
-                    block["total_spaces"], block["neighborhood"],
-                    req.is_raining, req.has_nearby_event,
-                    req.is_holiday, req.is_school_day, req.temperature
-                )
-                pct = float(model.predict(features)[0])
-                pct = round(min(100.0, max(0.0, pct)), 2)
-                available = int(block["total_spaces"] * (1 - pct / 100))
-                all_blocks_with_dist.append(BlockPrediction(
-                    block_id=block["block_id"],
-                    street=block["street"],
-                    lat=block["lat"],
-                    lon=block["lon"],
-                    total_spaces=block["total_spaces"],
-                    neighborhood=block["neighborhood"],
-                    distance_meters=int(dist),
-                    predicted_occupancy_pct=pct,
-                    available_spaces_estimate=available,
-                    demand_level=get_demand_level(pct),
-                    color=get_color(pct),
-                ))
-            except Exception:
-                continue
-        all_blocks_with_dist.sort(key=lambda x: x.distance_meters)
-        nearby_blocks = all_blocks_with_dist[:8]
+    scored = score_blocks(near.drop(columns=["distance_m"]), arrival_ts)
+    scored["distance_m"] = near["distance_m"].values
+
+    out: List[BlockPrediction] = []
+    for _, r in scored.iterrows():
+        lat = float(r["lat"])
+        lon = float(r["lon"])
+        occ = float(r["predicted_occupancy_pct"])
+        nbh = str(r["neighborhood"])
+        out.append(BlockPrediction(
+            block_id=f"b_{lat:.5f}_{lon:.5f}",
+            street=street_label_for(lat, lon, nbh),
+            lat=lat,
+            lon=lon,
+            total_spaces=int(r["total_spaces"]),
+            neighborhood=nbh,
+            distance_meters=int(round(float(r["distance_m"]))),
+            predicted_occupancy_pct=round(occ, 2),
+            available_spaces_estimate=int(r["available_spaces"]),
+            demand_level=demand_level(occ),
+            color=color_for(occ),
+        ))
+
+    out.sort(key=lambda b: b.distance_meters)
 
     return BlockPredictionResponse(
         destination_lat=req.lat,
@@ -486,36 +509,6 @@ def predict_blocks(req: BlockPredictionRequest):
         radius_meters=req.radius_meters,
         predicted_at_hour=arrival_hour,
         minutes_away=req.minutes_away,
-        total_blocks_found=len(nearby_blocks),
-        blocks=nearby_blocks,
+        total_blocks_found=len(out),
+        blocks=out,
     )
-
-@app.get("/geocode_proxy")
-def geocode_proxy(q: str):
-    import requests as req
-    try:
-        resp = req.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={
-                "q": f"{q} San Francisco CA",
-                "format": "json",
-                "limit": 6,
-                "addressdetails": 1,
-            },
-            headers={
-                "User-Agent": "ParkCastSF/1.0 (university project usfca.edu)",
-                "Accept-Language": "en",
-                "Referer": "https://parkcast-frontend.vercel.app",
-            },
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        filtered = [d for d in data if
-            "san francisco" in d.get("display_name","").lower() or
-            "california" in d.get("display_name","").lower()
-        ]
-        return filtered if filtered else data
-    except Exception as e:
-        logger.error(f"Geocode error: {e}")
-        return []
