@@ -4,10 +4,9 @@ const nextConfig = {
     return [
       {
         source: '/api/:path*',
-        destination: 'http://34.133.160.231:8000/:path*',
+        destination: 'https://parkcast-api-904706413856.us-central1.run.app/:path*',
       },
     ];
   },
 };
-
 export default nextConfig;
