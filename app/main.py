@@ -59,23 +59,52 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.csv")
 
 # ── Feature schema (must stay in sync with dev/train_lightgbm.ipynb) ─────────
 FEATURES_NUMERIC = [
-    "hour", "day_of_week", "month", "is_weekend", "is_holiday",
-    "is_school_day", "is_raining", "temperature", "event_intensity",
-    "citation_count", "citations_hourly_median",
-    "lat", "lon", "total_spaces",
-    "block_mean", "block_hour_mean",
-    "lag_7d", "lag_14d", "lag_28d",
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "is_holiday",
+    "is_school_day",
+    "is_raining",
+    "temperature",
+    "event_intensity",
+    "citation_count",
+    "citations_hourly_median",
+    "lat",
+    "lon",
+    "total_spaces",
+    "block_mean",
+    "block_hour_mean",
+    "lag_7d",
+    "lag_14d",
+    "lag_28d",
 ]
 FEATURES_CATEGORICAL = ["neighborhood"]
 FEATURES = FEATURES_NUMERIC + FEATURES_CATEGORICAL
 
 US_HOLIDAYS = {
-    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 5, 26),
-    date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1), date(2025, 10, 13),
-    date(2025, 11, 11), date(2025, 11, 27), date(2025, 12, 25),
-    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 5, 25),
-    date(2026, 6, 19), date(2026, 7, 4), date(2026, 9, 7), date(2026, 10, 12),
-    date(2026, 11, 11), date(2026, 11, 26), date(2026, 12, 25),
+    date(2025, 1, 1),
+    date(2025, 1, 20),
+    date(2025, 2, 17),
+    date(2025, 5, 26),
+    date(2025, 6, 19),
+    date(2025, 7, 4),
+    date(2025, 9, 1),
+    date(2025, 10, 13),
+    date(2025, 11, 11),
+    date(2025, 11, 27),
+    date(2025, 12, 25),
+    date(2026, 1, 1),
+    date(2026, 1, 19),
+    date(2026, 2, 16),
+    date(2026, 5, 25),
+    date(2026, 6, 19),
+    date(2026, 7, 4),
+    date(2026, 9, 7),
+    date(2026, 10, 12),
+    date(2026, 11, 11),
+    date(2026, 11, 26),
+    date(2026, 12, 25),
 }
 
 
@@ -101,9 +130,9 @@ def _load_all() -> None:
     model = joblib.load(MODEL_PATH)
     block_aggs = pd.read_parquet(BLOCK_AGG_PATH)
     blocks = pd.read_parquet(BLOCKS_PATH)
-    lag_hist = (pd.read_parquet(LAG_PATH)
-                  .sort_values(["lat", "lon", "timestamp"])
-                  .reset_index(drop=True))
+    lag_hist = (
+        pd.read_parquet(LAG_PATH).sort_values(["lat", "lon", "timestamp"]).reset_index(drop=True)
+    )
     cit_lookup = pd.read_parquet(CIT_LOOKUP_PATH)
 
     if os.path.exists(MASTER_PATH):
@@ -112,11 +141,10 @@ def _load_all() -> None:
     if os.path.exists(EVENTS_PATH):
         events = pd.read_csv(EVENTS_PATH, parse_dates=["date"])
     else:
-        events = pd.DataFrame(columns=["date", "venue_lat", "venue_lon",
-                                       "start_hour", "end_hour"])
+        events = pd.DataFrame(columns=["date", "venue_lat", "venue_lon", "start_hour", "end_hour"])
 
     if os.path.exists(META_PATH):
-        with open(META_PATH) as f:
+        with open(META_PATH, encoding="utf-8") as f:
             meta = json.load(f)
             global_baseline_mean = float(meta.get("global_mean", 50.0))
 
@@ -163,8 +191,7 @@ def _weather_day(day_iso: str) -> Optional[dict]:
         hours = [datetime.fromisoformat(t).hour for t in data["hourly"]["time"]]
         temps = data["hourly"]["temperature_2m"]
         precip = data["hourly"]["precipitation"]
-        return {h: (float(t), 1 if (p or 0) > 0.1 else 0)
-                for h, t, p in zip(hours, temps, precip)}
+        return {h: (float(t), 1 if (p or 0) > 0.1 else 0) for h, t, p in zip(hours, temps, precip)}
     except Exception:
         return None
 
@@ -177,16 +204,14 @@ def weather_for(ts: datetime) -> tuple[float, int]:
 
 
 # ── Geo helpers ──────────────────────────────────────────────────────────────
-def haversine_vec(lat1: float, lon1: float,
-                  lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+def haversine_vec(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
     """Vectorized haversine distance in meters, scalar origin → array dest."""
     R = 6_371_000
     lat1r = math.radians(lat1)
     lat2r = np.radians(lat2)
     dlat = np.radians(lat2 - lat1)
     dlon = np.radians(lon2 - lon1)
-    a = (np.sin(dlat / 2) ** 2
-         + math.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2)
+    a = np.sin(dlat / 2) ** 2 + math.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2
     return 2 * R * np.arcsin(np.sqrt(a))
 
 
@@ -200,8 +225,7 @@ def is_school_day(d: date) -> int:
     return 1
 
 
-def event_intensity_at(lat: float, lon: float, ts: datetime,
-                       radius_m: float = 800.0) -> float:
+def event_intensity_at(lat: float, lon: float, ts: datetime, radius_m: float = 800.0) -> float:
     """max(exp(-dist_m / 300)) over active events within `radius_m`. Matches
     the encoding used during training (see dev/preprocess_real_data.ipynb)."""
     if events is None or events.empty:
@@ -209,13 +233,10 @@ def event_intensity_at(lat: float, lon: float, ts: datetime,
     same_day = events[events["date"].dt.date == ts.date()]
     if same_day.empty:
         return 0.0
-    in_window = same_day[(same_day["start_hour"] <= ts.hour)
-                         & (ts.hour <= same_day["end_hour"])]
+    in_window = same_day[(same_day["start_hour"] <= ts.hour) & (ts.hour <= same_day["end_hour"])]
     if in_window.empty:
         return 0.0
-    dists = haversine_vec(lat, lon,
-                          in_window["venue_lat"].values,
-                          in_window["venue_lon"].values)
+    dists = haversine_vec(lat, lon, in_window["venue_lat"].values, in_window["venue_lon"].values)
     close = dists <= radius_m
     if not close.any():
         return 0.0
@@ -224,39 +245,38 @@ def event_intensity_at(lat: float, lon: float, ts: datetime,
 
 def lag_value(lat: float, lon: float, ts: datetime, days: int) -> float:
     target = ts - timedelta(days=days)
-    mask = ((lag_hist["lat"] == lat)
-            & (lag_hist["lon"] == lon)
-            & (lag_hist["timestamp"] == target))
+    mask = (lag_hist["lat"] == lat) & (lag_hist["lon"] == lon) & (lag_hist["timestamp"] == target)
     hit = lag_hist.loc[mask, "occupancy_pct"]
     return float(hit.iloc[0]) if len(hit) else np.nan
 
 
-def block_aggregates_for(lat: float, lon: float, hour: int, dow: int
-                         ) -> tuple[float, float, float]:
+def block_aggregates_for(lat: float, lon: float, hour: int, dow: int) -> tuple[float, float, float]:
     """(block_mean, block_hour_mean, block_hour_dow_mean) with progressive
     fallbacks. block_hour_dow_mean is the additive baseline the residual
     LightGBM was trained against."""
     exact = block_aggs[
-        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)
-        & (block_aggs["hour"] == hour) & (block_aggs["day_of_week"] == dow)
+        (block_aggs["lat"] == lat)
+        & (block_aggs["lon"] == lon)
+        & (block_aggs["hour"] == hour)
+        & (block_aggs["day_of_week"] == dow)
     ]
     if len(exact):
         r = exact.iloc[0]
-        return (float(r["block_mean"]), float(r["block_hour_mean"]),
-                float(r["block_hour_dow_mean"]))
+        return (
+            float(r["block_mean"]),
+            float(r["block_hour_mean"]),
+            float(r["block_hour_dow_mean"]),
+        )
 
     hour_only = block_aggs[
-        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)
-        & (block_aggs["hour"] == hour)
+        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon) & (block_aggs["hour"] == hour)
     ]
     if len(hour_only):
         bhm = float(hour_only["block_hour_mean"].iloc[0])
         bm = float(hour_only["block_mean"].iloc[0])
         return bm, bhm, bhm
 
-    block_only = block_aggs[
-        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)
-    ]
+    block_only = block_aggs[(block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)]
     if len(block_only):
         bm = float(block_only["block_mean"].iloc[0])
         return bm, bm, bm
@@ -266,14 +286,11 @@ def block_aggregates_for(lat: float, lon: float, hour: int, dow: int
 
 
 def citations_median(hour: int, dow: int) -> float:
-    row = cit_lookup[
-        (cit_lookup["hour"] == hour) & (cit_lookup["day_of_week"] == dow)
-    ]
+    row = cit_lookup[(cit_lookup["hour"] == hour) & (cit_lookup["day_of_week"] == dow)]
     return float(row["citations_hourly_median"].iloc[0]) if len(row) else 0.0
 
 
-def build_feature_row(block_row: pd.Series, ts: datetime,
-                      temp_f: float, raining: int) -> dict:
+def build_feature_row(block_row: pd.Series, ts: datetime, temp_f: float, raining: int) -> dict:
     lat = float(block_row["lat"])
     lon = float(block_row["lon"])
     hour = ts.hour
@@ -308,8 +325,7 @@ def score_blocks(block_df: pd.DataFrame, ts: datetime) -> pd.DataFrame:
     """Run the residual LightGBM and add occupancy + available-spaces columns.
     Residual is added to block_hour_dow_mean baseline (see train_lightgbm)."""
     temp_f, raining = weather_for(ts)
-    rows = [build_feature_row(r, ts, temp_f, raining)
-            for _, r in block_df.iterrows()]
+    rows = [build_feature_row(r, ts, temp_f, raining) for _, r in block_df.iterrows()]
     feat = pd.DataFrame(rows)
     baselines = feat.pop("_baseline").values
     feat["neighborhood"] = feat["neighborhood"].astype("category")
@@ -321,8 +337,7 @@ def score_blocks(block_df: pd.DataFrame, ts: datetime) -> pd.DataFrame:
 
     out = block_df.copy().reset_index(drop=True)
     out["predicted_occupancy_pct"] = occupancy.round(2)
-    out["available_spaces"] = (out["total_spaces"]
-                               * (1 - occupancy / 100)).round().astype(int)
+    out["available_spaces"] = (out["total_spaces"] * (1 - occupancy / 100)).round().astype(int)
     return out
 
 
@@ -340,12 +355,12 @@ def demand_level(pct: float) -> str:
 def color_for(pct: float) -> str:
     """Hex color used by the frontend map markers. Matches the UI legend."""
     if pct < 40:
-        return "#22c55e"   # green  — Easy
+        return "#22c55e"  # green  — Easy
     if pct < 70:
-        return "#f59e0b"   # amber  — Moderate
+        return "#f59e0b"  # amber  — Moderate
     if pct < 85:
-        return "#f97316"   # orange — Hard
-    return "#ef4444"       # red    — Very Hard
+        return "#f97316"  # orange — Hard
+    return "#ef4444"  # red    — Very Hard
 
 
 def street_label_for(lat: float, lon: float, neighborhood: str) -> str:
@@ -356,8 +371,7 @@ def street_label_for(lat: float, lon: float, neighborhood: str) -> str:
         if candidate_cols:
             # Nearest master block within ~80m (street-segment centers can
             # drift from metered centroids).
-            dists = haversine_vec(lat, lon,
-                                  master["lat"].values, master["lon"].values)
+            dists = haversine_vec(lat, lon, master["lat"].values, master["lon"].values)
             nearest = int(np.argmin(dists))
             if dists[nearest] <= 80.0:
                 for col in candidate_cols:
@@ -377,6 +391,7 @@ class BlockPredictionRequest(BaseModel):
     Open-Meteo + the events catalog, so the client-supplied values are accepted
     for backwards compatibility but deliberately ignored — the server's answer
     stays self-consistent even if the browser's weather fetch failed."""
+
     lat: float = Field(..., description="Destination latitude")
     lon: float = Field(..., description="Destination longitude")
     radius_meters: int = Field(1500, ge=100, le=3000)
@@ -440,8 +455,7 @@ def health():
         "model_type": type(model).__name__,
         "num_features": len(FEATURES),
         "total_blocks_in_db": int(len(blocks)),
-        "trained_test_mae": meta.get("metrics", {})
-                                 .get("residual_model", {}).get("mae"),
+        "trained_test_mae": meta.get("metrics", {}).get("residual_model", {}).get("mae"),
     }
 
 
@@ -456,8 +470,7 @@ def predict_blocks_endpoint(req: BlockPredictionRequest):
     arrival_ts = datetime.now() + timedelta(minutes=req.minutes_away)
     arrival_hour = arrival_ts.hour
 
-    dists = haversine_vec(req.lat, req.lon,
-                          blocks["lat"].values, blocks["lon"].values)
+    dists = haversine_vec(req.lat, req.lon, blocks["lat"].values, blocks["lon"].values)
     mask = dists <= req.radius_meters
 
     if mask.any():
@@ -470,9 +483,13 @@ def predict_blocks_endpoint(req: BlockPredictionRequest):
 
     if near.empty:
         return BlockPredictionResponse(
-            destination_lat=req.lat, destination_lon=req.lon,
-            radius_meters=req.radius_meters, predicted_at_hour=arrival_hour,
-            minutes_away=req.minutes_away, total_blocks_found=0, blocks=[],
+            destination_lat=req.lat,
+            destination_lon=req.lon,
+            radius_meters=req.radius_meters,
+            predicted_at_hour=arrival_hour,
+            minutes_away=req.minutes_away,
+            total_blocks_found=0,
+            blocks=[],
         )
 
     near = near.reset_index(drop=True)
@@ -487,19 +504,21 @@ def predict_blocks_endpoint(req: BlockPredictionRequest):
         lon = float(r["lon"])
         occ = float(r["predicted_occupancy_pct"])
         nbh = str(r["neighborhood"])
-        out.append(BlockPrediction(
-            block_id=f"b_{lat:.5f}_{lon:.5f}",
-            street=street_label_for(lat, lon, nbh),
-            lat=lat,
-            lon=lon,
-            total_spaces=int(r["total_spaces"]),
-            neighborhood=nbh,
-            distance_meters=int(round(float(r["distance_m"]))),
-            predicted_occupancy_pct=round(occ, 2),
-            available_spaces_estimate=int(r["available_spaces"]),
-            demand_level=demand_level(occ),
-            color=color_for(occ),
-        ))
+        out.append(
+            BlockPrediction(
+                block_id=f"b_{lat:.5f}_{lon:.5f}",
+                street=street_label_for(lat, lon, nbh),
+                lat=lat,
+                lon=lon,
+                total_spaces=int(r["total_spaces"]),
+                neighborhood=nbh,
+                distance_meters=int(round(float(r["distance_m"]))),
+                predicted_occupancy_pct=round(occ, 2),
+                available_spaces_estimate=int(r["available_spaces"]),
+                demand_level=demand_level(occ),
+                color=color_for(occ),
+            )
+        )
 
     out.sort(key=lambda b: b.distance_meters)
 
