@@ -51,12 +51,25 @@ EVENTS_PATH = os.path.join(DATA_DIR, "events.csv")
 
 # ── Feature schema (must match train_lightgbm.py) ────────────────────────────
 FEATURES_NUMERIC = [
-    "hour", "day_of_week", "month", "is_weekend", "is_holiday",
-    "is_school_day", "is_raining", "temperature", "event_intensity",
-    "citation_count", "citations_hourly_median",
-    "lat", "lon", "total_spaces",
-    "block_mean", "block_hour_mean",
-    "lag_7d", "lag_14d", "lag_28d",
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "is_holiday",
+    "is_school_day",
+    "is_raining",
+    "temperature",
+    "event_intensity",
+    "citation_count",
+    "citations_hourly_median",
+    "lat",
+    "lon",
+    "total_spaces",
+    "block_mean",
+    "block_hour_mean",
+    "lag_7d",
+    "lag_14d",
+    "lag_28d",
 ]
 FEATURES_CATEGORICAL = ["neighborhood"]
 FEATURES = FEATURES_NUMERIC + FEATURES_CATEGORICAL
@@ -65,12 +78,28 @@ BASELINE_COL = "block_hour_dow_mean"
 # US federal holidays observed in SF for training window. Keep hardcoded —
 # small set, no extra dependency.
 US_HOLIDAYS = {
-    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17), date(2025, 5, 26),
-    date(2025, 6, 19), date(2025, 7, 4), date(2025, 9, 1), date(2025, 10, 13),
-    date(2025, 11, 11), date(2025, 11, 27), date(2025, 12, 25),
-    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 5, 25),
-    date(2026, 6, 19), date(2026, 7, 4), date(2026, 9, 7), date(2026, 10, 12),
-    date(2026, 11, 11), date(2026, 11, 26), date(2026, 12, 25),
+    date(2025, 1, 1),
+    date(2025, 1, 20),
+    date(2025, 2, 17),
+    date(2025, 5, 26),
+    date(2025, 6, 19),
+    date(2025, 7, 4),
+    date(2025, 9, 1),
+    date(2025, 10, 13),
+    date(2025, 11, 11),
+    date(2025, 11, 27),
+    date(2025, 12, 25),
+    date(2026, 1, 1),
+    date(2026, 1, 19),
+    date(2026, 2, 16),
+    date(2026, 5, 25),
+    date(2026, 6, 19),
+    date(2026, 7, 4),
+    date(2026, 9, 7),
+    date(2026, 10, 12),
+    date(2026, 11, 11),
+    date(2026, 11, 26),
+    date(2026, 12, 25),
 }
 
 
@@ -82,15 +111,16 @@ master: Optional[pd.DataFrame] = None
 lag_hist: Optional[pd.DataFrame] = None
 cit_lookup: Optional[pd.DataFrame] = None
 events: Optional[pd.DataFrame] = None
-sfpark_lookup: dict = {}            # {(pm_district, hour, is_weekend): occ_pct}
+sfpark_lookup: dict = {}  # {(pm_district, hour, is_weekend): occ_pct}
 neighborhood_to_district: dict = {}  # {neighborhood: pm_district}
 meta: dict = {}
 global_baseline_mean: float = 50.0
 
 
 def _load_all():
-    global model, block_aggs, blocks, master, lag_hist, cit_lookup, events, meta, \
-        global_baseline_mean, sfpark_lookup, neighborhood_to_district
+    global model, block_aggs, blocks, master, lag_hist, cit_lookup
+    global events, meta, global_baseline_mean
+    global sfpark_lookup, neighborhood_to_district
 
     model = joblib.load(MODEL_PATH)
     block_aggs = pd.read_parquet(BLOCK_AGG_PATH)
@@ -108,7 +138,7 @@ def _load_all():
             for _, r in cal.iterrows()
         }
     if os.path.exists(SFPARK_META_PATH):
-        with open(SFPARK_META_PATH) as f:
+        with open(SFPARK_META_PATH, encoding="utf-8") as f:
             mapping = json.load(f).get("district_to_neighborhoods", {})
         neighborhood_to_district = {
             nbh: district for district, nbhs in mapping.items() for nbh in nbhs
@@ -117,11 +147,10 @@ def _load_all():
     if os.path.exists(EVENTS_PATH):
         events = pd.read_csv(EVENTS_PATH, parse_dates=["date"])
     else:
-        events = pd.DataFrame(columns=["date", "venue_lat", "venue_lon",
-                                       "start_hour", "end_hour"])
+        events = pd.DataFrame(columns=["date", "venue_lat", "venue_lon", "start_hour", "end_hour"])
 
     if os.path.exists(META_PATH):
-        with open(META_PATH) as f:
+        with open(META_PATH, encoding="utf-8") as f:
             meta = json.load(f)
             global_baseline_mean = float(meta.get("global_mean", 50.0))
 
@@ -168,8 +197,7 @@ def _weather_day(day_iso: str):
         hours = [datetime.fromisoformat(t).hour for t in data["hourly"]["time"]]
         temps = data["hourly"]["temperature_2m"]
         precip = data["hourly"]["precipitation"]
-        return {h: (float(t), 1 if (p or 0) > 0.1 else 0)
-                for h, t, p in zip(hours, temps, precip)}
+        return {h: (float(t), 1 if (p or 0) > 0.1 else 0) for h, t, p in zip(hours, temps, precip)}
     except Exception:
         return None
 
@@ -232,11 +260,7 @@ def event_intensity_at(lat: float, lon: float, ts: datetime, radius_m: float = 8
 def lag_value(lat: float, lon: float, ts: datetime, days: int) -> float:
     """Return occupancy_pct at (lat, lon) at ts - `days`*24h, or NaN."""
     target = ts - timedelta(days=days)
-    mask = (
-        (lag_hist["lat"] == lat)
-        & (lag_hist["lon"] == lon)
-        & (lag_hist["timestamp"] == target)
-    )
+    mask = (lag_hist["lat"] == lat) & (lag_hist["lon"] == lon) & (lag_hist["timestamp"] == target)
     hit = lag_hist.loc[mask, "occupancy_pct"]
     return float(hit.iloc[0]) if len(hit) else np.nan
 
@@ -252,13 +276,14 @@ def block_aggregates_for(lat: float, lon: float, hour: int, dow: int):
     ]
     if len(row):
         r = row.iloc[0]
-        return (float(r["block_mean"]), float(r["block_hour_mean"]),
-                float(r["block_hour_dow_mean"]))
+        return (
+            float(r["block_mean"]),
+            float(r["block_hour_mean"]),
+            float(r["block_hour_dow_mean"]),
+        )
     # Hour-only fallback
     row = block_aggs[
-        (block_aggs["lat"] == lat)
-        & (block_aggs["lon"] == lon)
-        & (block_aggs["hour"] == hour)
+        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon) & (block_aggs["hour"] == hour)
     ]
     if len(row):
         bhm = float(row["block_hour_mean"].iloc[0])
@@ -406,14 +431,18 @@ class NearbyOut(BaseModel):
 
 
 def demand_level(pct: float) -> str:
-    if pct < 40: return "Low"
-    if pct < 70: return "Medium"
-    if pct < 85: return "High"
+    if pct < 40:
+        return "Low"
+    if pct < 70:
+        return "Medium"
+    if pct < 85:
+        return "High"
     return "Very High"
 
 
-def advisory_for(cls: str, occ: Optional[float] = None, rpp_area: str = "",
-                 hrlimit: Optional[float] = None) -> str:
+def advisory_for(
+    cls: str, occ: Optional[float] = None, rpp_area: str = "", hrlimit: Optional[float] = None
+) -> str:
     if cls == "metered":
         if occ is None:
             return "Metered — no prediction"
@@ -488,17 +517,23 @@ def predict(inp: PredictIn):
 # below. RPP and no-parking are always penalized — they're not usable to a
 # driver without a permit regardless of actual occupancy.
 CLASS_PRIOR_FALLBACK = {
-    "metered": None,       # use model output
-    "unmetered": 55.0,     # residential curb fallback
+    "metered": None,  # use model output
+    "unmetered": 55.0,  # residential curb fallback
     "time_limited": 60.0,
     "rpp": 90.0,
     "no_parking": 99.0,
 }
 
 
-def prior_for(cls: str, neighborhood: Optional[str], hour: int, is_weekend: int,
-              event_intensity: float = 0.0, is_raining: int = 0,
-              temperature_f: Optional[float] = None) -> float:
+def prior_for(
+    cls: str,
+    neighborhood: Optional[str],
+    hour: int,
+    is_weekend: int,
+    event_intensity: float = 0.0,
+    is_raining: int = 0,
+    temperature_f: Optional[float] = None,
+) -> float:
     """Baseline occupancy prior for non-metered blocks. LightGBM ignores
     event_intensity (event rows are 0.02% of metered training data and
     recurring-venue patterns are baked into block×hr×dow means). The
@@ -529,12 +564,12 @@ def nearby(inp: NearbyIn):
     ts = inp.timestamp or datetime.now()
 
     # Distance filter over the citywide master catalog
-    dists = haversine_vec(inp.dest_lat, inp.dest_lon,
-                          master["lat"].values, master["lon"].values)
+    dists = haversine_vec(inp.dest_lat, inp.dest_lon, master["lat"].values, master["lon"].values)
     mask = dists <= inp.radius_m
     if not mask.any():
-        return NearbyOut(timestamp=ts, dest_lat=inp.dest_lat, dest_lon=inp.dest_lon,
-                         weather={}, blocks=[])
+        return NearbyOut(
+            timestamp=ts, dest_lat=inp.dest_lat, dest_lon=inp.dest_lon, weather={}, blocks=[]
+        )
     near = master.loc[mask].copy()
     near["distance_m"] = dists[mask]
 
@@ -543,7 +578,8 @@ def nearby(inp: NearbyIn):
     pred_map: dict = {}
     if metered_mask.any():
         met = near.loc[metered_mask, ["metered_lat", "metered_lon"]].rename(
-            columns={"metered_lat": "lat", "metered_lon": "lon"})
+            columns={"metered_lat": "lat", "metered_lon": "lon"}
+        )
         met = met.merge(blocks, on=["lat", "lon"], how="left")
         preds = predict_blocks(met, ts)
         for i, idx in enumerate(near.index[metered_mask]):
@@ -569,8 +605,9 @@ def nearby(inp: NearbyIn):
             occ_score = occ
         else:
             evi = event_intensity_at(float(r["lat"]), float(r["lon"]), ts)
-            occ_score = prior_for(cls, master_nbh, hour, is_wknd, evi,
-                                   is_raining=raining, temperature_f=temp_f)
+            occ_score = prior_for(
+                cls, master_nbh, hour, is_wknd, evi, is_raining=raining, temperature_f=temp_f
+            )
             nbh = master_nbh
             if pd.notna(r.get("total_spaces")):
                 total = int(r["total_spaces"])
@@ -592,29 +629,42 @@ def nearby(inp: NearbyIn):
         score = 0.7 * occ_score + 0.3 * (dist / inp.radius_m * 100) + zone_penalty
         rpp_area = str(r.get("rpp_area") or "") if pd.notna(r.get("rpp_area")) else ""
         hrl = float(r["hrlimit"]) if pd.notna(r.get("hrlimit")) else None
-        results.append((score, NearbyBlock(
-            cnn=float(r["cnn"]) if pd.notna(r.get("cnn")) else None,
-            lat=float(r["lat"]),
-            lon=float(r["lon"]),
-            block_class=cls,
-            corridor=str(r["corridor"]) if pd.notna(r.get("corridor")) else None,
-            limits=str(r["limits"]) if pd.notna(r.get("limits")) else None,
-            distance_m=round(dist, 1),
-            advisory=advisory_for(cls, occ, rpp_area, hrl),
-            score=round(score, 2),
-            neighborhood=nbh,
-            total_spaces=total,
-            predicted_occupancy_pct=round(occ, 2) if occ is not None else None,
-            available_spaces=avail,
-            demand_level=dlvl,
-            rpp_area=rpp_area or None,
-            hrlimit=hrl,
-            has_blue_zone=bool(r.get("has_blue_zone")) if pd.notna(r.get("has_blue_zone")) else None,
-            has_bus_zone=bool(r.get("has_bus_zone")) if pd.notna(r.get("has_bus_zone")) else None,
-            has_shuttle_stop=bool(r.get("has_shuttle_stop")) if pd.notna(r.get("has_shuttle_stop")) else None,
-        )))
+        results.append(
+            (
+                score,
+                NearbyBlock(
+                    cnn=float(r["cnn"]) if pd.notna(r.get("cnn")) else None,
+                    lat=float(r["lat"]),
+                    lon=float(r["lon"]),
+                    block_class=cls,
+                    corridor=str(r["corridor"]) if pd.notna(r.get("corridor")) else None,
+                    limits=str(r["limits"]) if pd.notna(r.get("limits")) else None,
+                    distance_m=round(dist, 1),
+                    advisory=advisory_for(cls, occ, rpp_area, hrl),
+                    score=round(score, 2),
+                    neighborhood=nbh,
+                    total_spaces=total,
+                    predicted_occupancy_pct=round(occ, 2) if occ is not None else None,
+                    available_spaces=avail,
+                    demand_level=dlvl,
+                    rpp_area=rpp_area or None,
+                    hrlimit=hrl,
+                    has_blue_zone=(
+                        bool(r.get("has_blue_zone")) if pd.notna(r.get("has_blue_zone")) else None
+                    ),
+                    has_bus_zone=(
+                        bool(r.get("has_bus_zone")) if pd.notna(r.get("has_bus_zone")) else None
+                    ),
+                    has_shuttle_stop=(
+                        bool(r.get("has_shuttle_stop"))
+                        if pd.notna(r.get("has_shuttle_stop"))
+                        else None
+                    ),
+                ),
+            )
+        )
     results.sort(key=lambda x: x[0])
-    top = [b for _, b in results[:inp.limit]]
+    top = [b for _, b in results[: inp.limit]]
 
     return NearbyOut(
         timestamp=ts,
