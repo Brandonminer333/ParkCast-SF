@@ -41,7 +41,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
 # ── Paths ────────────────────────────────────────────────────────────────────
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(APP_DIR, "models")
@@ -56,9 +55,29 @@ CIT_LOOKUP_PATH = os.path.join(MODEL_DIR, "citations_hourly_median.parquet")
 META_PATH = os.path.join(MODEL_DIR, "LightGBM.meta.json")
 EVENTS_PATH = os.path.join(DATA_DIR, "events.csv")
 
+# Per-block inference lookups built by `dev/build_block_lookups.py` from
+# `dev/processed_training_data.csv`. They let inference populate the static
+# and hour/dow-aggregate features the model was trained against.
+BLOCK_STATIC_PATH = os.path.join(MODEL_DIR, "block_static.parquet")
+COMPLAINTS_LOOKUP_PATH = os.path.join(MODEL_DIR, "complaints_lookup.parquet")
+SFPARK_LOOKUP_PATH = os.path.join(MODEL_DIR, "sfpark_lookup.parquet")
 
-# ── Feature schema (must stay in sync with dev/train_lightgbm.ipynb) ─────────
-FEATURES_NUMERIC = [
+# ── Model source ─────────────────────────────────────────────────────────────
+# Production loads the champion from the MLflow registry; local dev (or CI
+# without registry access) falls back to the legacy `joblib` artifact.
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "").strip()
+MLFLOW_MODEL_NAME = os.environ.get("MLFLOW_MODEL_NAME", "parkcast-occupancy-model")
+MLFLOW_MODEL_STAGE = os.environ.get("MLFLOW_MODEL_STAGE", "champion")
+
+
+# ── Feature schema ───────────────────────────────────────────────────────────
+# `FEATURES_SUPERSET_NUMERIC` lists every numeric column `build_feature_row`
+# knows how to produce. The `FEATURES` list that actually gets handed to the
+# model is derived at startup from `model.booster_.feature_name()` (see
+# `_load_all`), so that both the legacy 31-feature local model and the newer
+# 33-feature MLflow champion (which adds `lag_3d_mean` + `lag_7d_mean`) work
+# without code changes.
+FEATURES_SUPERSET_NUMERIC = [
     "hour",
     "day_of_week",
     "month",
@@ -70,17 +89,34 @@ FEATURES_NUMERIC = [
     "event_intensity",
     "citation_count",
     "citations_hourly_median",
+    "complaints_311_median",
+    "complaints_311_total",
+    "poi_dining_200m",
+    "poi_retail_200m",
+    "poi_transit_200m",
+    "poi_attraction_200m",
+    "sfpark_block_occ",
+    "permit_active",
+    "permit_count_30d",
     "lat",
     "lon",
     "total_spaces",
     "block_mean",
     "block_hour_mean",
+    "lag_1d",
+    "lag_2d",
     "lag_7d",
     "lag_14d",
     "lag_28d",
+    "lag_3d_mean",
+    "lag_7d_mean",
 ]
 FEATURES_CATEGORICAL = ["neighborhood"]
-FEATURES = FEATURES_NUMERIC + FEATURES_CATEGORICAL
+FEATURES_SUPERSET = FEATURES_SUPERSET_NUMERIC + FEATURES_CATEGORICAL
+
+# Populated in `_load_all`; default keeps the legacy inference path working.
+FEATURES_NUMERIC: List[str] = list(FEATURES_SUPERSET_NUMERIC)
+FEATURES: List[str] = list(FEATURES_SUPERSET)
 
 US_HOLIDAYS = {
     date(2025, 1, 1),
@@ -116,8 +152,45 @@ master: Optional[pd.DataFrame] = None
 lag_hist: Optional[pd.DataFrame] = None
 cit_lookup: Optional[pd.DataFrame] = None
 events: Optional[pd.DataFrame] = None
+block_static: Optional[pd.DataFrame] = None
+complaints_lookup: Optional[pd.DataFrame] = None
+sfpark_lookup: Optional[pd.DataFrame] = None
 meta: dict = {}
 global_baseline_mean: float = 50.0
+model_source: str = "unloaded"
+
+
+def _load_model():
+    """Return (estimator, source_label). Prefers the MLflow champion when
+    `MLFLOW_TRACKING_URI` is set, otherwise falls back to the local legacy
+    joblib artifact."""
+    if MLFLOW_TRACKING_URI:
+        import mlflow  # lazy — mlflow is optional in local dev
+        import mlflow.sklearn
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        mlflow.set_registry_uri(MLFLOW_TRACKING_URI)
+        uri = f"models:/{MLFLOW_MODEL_NAME}@{MLFLOW_MODEL_STAGE}"
+        loaded = mlflow.sklearn.load_model(uri)
+        return loaded, f"mlflow:{uri}"
+
+    if os.path.exists(MODEL_PATH):
+        return joblib.load(MODEL_PATH), f"joblib:{MODEL_PATH}"
+
+    return None, "unavailable"
+
+
+def _model_feature_order(loaded) -> Optional[List[str]]:
+    """Return the feature order the trained booster expects, if discoverable."""
+    booster = getattr(loaded, "booster_", None)
+    if booster is not None and hasattr(booster, "feature_name"):
+        names = list(booster.feature_name())
+        if names:
+            return names
+    names = getattr(loaded, "feature_name_", None)
+    if names:
+        return list(names)
+    return None
 
 
 def _load_all() -> None:
@@ -125,15 +198,31 @@ def _load_all() -> None:
     (events, master catalog) degrade gracefully; missing required assets
     leave `model` as None and /health will report 503."""
     global model, block_aggs, blocks, master, lag_hist, cit_lookup, events
-    global meta, global_baseline_mean
+    global block_static, complaints_lookup, sfpark_lookup
+    global meta, global_baseline_mean, model_source
+    global FEATURES, FEATURES_NUMERIC
 
-    model = joblib.load(MODEL_PATH)
+    model, model_source = _load_model()
+
+    if model is not None:
+        expected = _model_feature_order(model)
+        if expected:
+            FEATURES = expected
+            FEATURES_NUMERIC = [f for f in expected if f not in FEATURES_CATEGORICAL]
+
     block_aggs = pd.read_parquet(BLOCK_AGG_PATH)
     blocks = pd.read_parquet(BLOCKS_PATH)
     lag_hist = (
         pd.read_parquet(LAG_PATH).sort_values(["lat", "lon", "timestamp"]).reset_index(drop=True)
     )
     cit_lookup = pd.read_parquet(CIT_LOOKUP_PATH)
+
+    if os.path.exists(BLOCK_STATIC_PATH):
+        block_static = pd.read_parquet(BLOCK_STATIC_PATH)
+    if os.path.exists(COMPLAINTS_LOOKUP_PATH):
+        complaints_lookup = pd.read_parquet(COMPLAINTS_LOOKUP_PATH)
+    if os.path.exists(SFPARK_LOOKUP_PATH):
+        sfpark_lookup = pd.read_parquet(SFPARK_LOOKUP_PATH)
 
     if os.path.exists(MASTER_PATH):
         master = pd.read_parquet(MASTER_PATH)
@@ -250,6 +339,22 @@ def lag_value(lat: float, lon: float, ts: datetime, days: int) -> float:
     return float(hit.iloc[0]) if len(hit) else np.nan
 
 
+def lag_mean_value(lat: float, lon: float, ts: datetime, days: int) -> float:
+    """Mean `occupancy_pct` at (lat, lon) over the past `days` days across all
+    hours. Calendar-rolling window [ts - days, ts). Returns NaN if no rows."""
+    if lag_hist is None:
+        return np.nan
+    start = ts - timedelta(days=days)
+    mask = (
+        (lag_hist["lat"] == lat)
+        & (lag_hist["lon"] == lon)
+        & (lag_hist["timestamp"] >= start)
+        & (lag_hist["timestamp"] < ts)
+    )
+    hits = lag_hist.loc[mask, "occupancy_pct"]
+    return float(hits.mean()) if len(hits) else np.nan
+
+
 def block_aggregates_for(lat: float, lon: float, hour: int, dow: int) -> tuple[float, float, float]:
     """(block_mean, block_hour_mean, block_hour_dow_mean) with progressive
     fallbacks. block_hour_dow_mean is the additive baseline the residual
@@ -290,17 +395,81 @@ def citations_median(hour: int, dow: int) -> float:
     return float(row["citations_hourly_median"].iloc[0]) if len(row) else 0.0
 
 
+_POI_COLS = (
+    "poi_dining_200m",
+    "poi_retail_200m",
+    "poi_transit_200m",
+    "poi_attraction_200m",
+)
+_PERMIT_COLS = ("permit_active", "permit_count_30d")
+
+
+def block_static_for(lat: float, lon: float) -> dict:
+    """Per-block static POI counts + most-recent permit snapshot.
+
+    POIs are genuinely static across the training window. Permit columns are
+    time-varying in reality, but `build_block_lookups.py` snapshots the last
+    observed value per block as a stopgap until the serving layer gets a live
+    permits feed; predictions for long-in-the-future timestamps will be as
+    stale as that snapshot.
+    """
+    if block_static is None:
+        return {c: np.nan for c in (*_POI_COLS, *_PERMIT_COLS)}
+    row = block_static[(block_static["lat"] == lat) & (block_static["lon"] == lon)]
+    if row.empty:
+        return {c: np.nan for c in (*_POI_COLS, *_PERMIT_COLS)}
+    r = row.iloc[0]
+    return {c: float(r[c]) for c in (*_POI_COLS, *_PERMIT_COLS)}
+
+
+def complaints_for(lat: float, lon: float, hour: int, dow: int) -> tuple[float, float]:
+    """(complaints_311_median, complaints_311_total) for this block / hour / dow."""
+    if complaints_lookup is None:
+        return np.nan, np.nan
+    row = complaints_lookup[
+        (complaints_lookup["lat"] == lat)
+        & (complaints_lookup["lon"] == lon)
+        & (complaints_lookup["hour"] == hour)
+        & (complaints_lookup["day_of_week"] == dow)
+    ]
+    if row.empty:
+        return np.nan, np.nan
+    r = row.iloc[0]
+    return float(r["complaints_311_median"]), float(r["complaints_311_total"])
+
+
+def sfpark_for(lat: float, lon: float, hour: int, is_weekend: int) -> float:
+    """SFpark calibration occupancy for this block at this hour / weekendness."""
+    if sfpark_lookup is None:
+        return np.nan
+    row = sfpark_lookup[
+        (sfpark_lookup["lat"] == lat)
+        & (sfpark_lookup["lon"] == lon)
+        & (sfpark_lookup["hour"] == hour)
+        & (sfpark_lookup["is_weekend"] == is_weekend)
+    ]
+    if row.empty:
+        return np.nan
+    return float(row["sfpark_block_occ"].iloc[0])
+
+
 def build_feature_row(block_row: pd.Series, ts: datetime, temp_f: float, raining: int) -> dict:
     lat = float(block_row["lat"])
     lon = float(block_row["lon"])
     hour = ts.hour
     dow = ts.weekday()
+    is_weekend = 1 if dow >= 5 else 0
     bm, bhm, baseline = block_aggregates_for(lat, lon, hour, dow)
+
+    statics = block_static_for(lat, lon)
+    comp_med, comp_tot = complaints_for(lat, lon, hour, dow)
+    sfpark_occ = sfpark_for(lat, lon, hour, is_weekend)
+
     return {
         "hour": hour,
         "day_of_week": dow,
         "month": ts.month,
-        "is_weekend": 1 if dow >= 5 else 0,
+        "is_weekend": is_weekend,
         "is_holiday": 1 if ts.date() in US_HOLIDAYS else 0,
         "is_school_day": is_school_day(ts.date()),
         "is_raining": raining,
@@ -308,14 +477,27 @@ def build_feature_row(block_row: pd.Series, ts: datetime, temp_f: float, raining
         "event_intensity": event_intensity_at(lat, lon, ts),
         "citation_count": 0.0,
         "citations_hourly_median": citations_median(hour, dow),
+        "complaints_311_median": comp_med,
+        "complaints_311_total": comp_tot,
+        "poi_dining_200m": statics["poi_dining_200m"],
+        "poi_retail_200m": statics["poi_retail_200m"],
+        "poi_transit_200m": statics["poi_transit_200m"],
+        "poi_attraction_200m": statics["poi_attraction_200m"],
+        "sfpark_block_occ": sfpark_occ,
+        "permit_active": statics["permit_active"],
+        "permit_count_30d": statics["permit_count_30d"],
         "lat": lat,
         "lon": lon,
         "total_spaces": int(block_row["total_spaces"]),
         "block_mean": bm,
         "block_hour_mean": bhm,
+        "lag_1d": lag_value(lat, lon, ts, 1),
+        "lag_2d": lag_value(lat, lon, ts, 2),
         "lag_7d": lag_value(lat, lon, ts, 7),
         "lag_14d": lag_value(lat, lon, ts, 14),
         "lag_28d": lag_value(lat, lon, ts, 28),
+        "lag_3d_mean": lag_mean_value(lat, lon, ts, 3),
+        "lag_7d_mean": lag_mean_value(lat, lon, ts, 7),
         "neighborhood": str(block_row["neighborhood"]),
         "_baseline": baseline,
     }
@@ -453,6 +635,7 @@ def health():
         "status": "healthy",
         "model_loaded": True,
         "model_type": type(model).__name__,
+        "model_source": model_source,
         "num_features": len(FEATURES),
         "total_blocks_in_db": int(len(blocks)),
         "trained_test_mae": meta.get("metrics", {}).get("residual_model", {}).get("mae"),

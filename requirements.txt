@@ -2,7 +2,6 @@
 # $ conda create --name <env> --file <this file>
 # platform: osx-arm64
 # created-by: conda 26.1.1
-# Python 3.13
 annotated-doc=0.0.4=py313hca03da5_0
 annotated-types=0.6.0=py313hca03da5_1
 anyio=4.12.1=py313hca03da5_0
@@ -42,6 +41,7 @@ httptools=0.7.1=py313haa24f5a_0
 httpx=0.28.1=py313hca03da5_1
 icu=73.1=h313beb8_0
 idna=3.11=py313hca03da5_0
+iniconfig=2.3.0=py313hca03da5_0
 jansson=2.14=h80987f9_1
 jinja2=3.1.6=py313hca03da5_0
 joblib=1.5.3=py313hca03da5_0
@@ -96,12 +96,14 @@ pandas=3.0.2=py313h3f644e9_0
 pathspec=1.0.4=py313hca03da5_0
 pip=26.0.1=pyhc872135_1
 platformdirs=4.9.4=py313hca03da5_0
+pluggy=1.6.0=py313hca03da5_0
 pyarrow=23.0.1=cpu_py313h0d527a1_3
 pydantic=2.13.2=py313hca03da5_0
 pydantic-core=2.46.2=py313h3983f12_0
 pydantic-extra-types=2.11.0=py313hca03da5_0
 pydantic-settings=2.12.0=py313hca03da5_0
 pygments=2.20.0=py313hca03da5_0
+pytest=9.0.2=py313hca03da5_0
 python=3.13.13=ha8cd034_100_cp313
 python-dateutil=2.9.0post0=py313hca03da5_2
 python-dotenv=1.2.1=py313hca03da5_0
