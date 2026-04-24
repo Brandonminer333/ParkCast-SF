@@ -35,6 +35,12 @@ jobs:
         with:
           project_id: parkcast
 
+      - name: Bootstrap static data files from GCS
+        run: |
+          mkdir -p data
+          gsutil -m cp gs://parkcast-bucket/data-bootstrap/*.csv data/
+          ls -la data/
+
       - name: Run full refresh pipeline
         run: bash dev/refresh_all.sh
         env:
