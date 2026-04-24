@@ -58,6 +58,15 @@ jobs:
 
       - name: Run pytest
         # Runs every marker (unit, functional, integration, application).
-        # Integration + application require app/models/* assets, which are
-        # committed to the repo, so they will execute on CI as well.
-        run: pytest -q
+        # Integration + application tests load the legacy on-disk model from
+        # `app/models/` because the repo commits those artifacts; the MLflow
+        # smoke test in `tests/test_integration.py` skips when
+        # `MLFLOW_TRACKING_URI` is empty. To exercise the MLflow path on CI,
+        # add an `MLFLOW_TRACKING_URI` repo secret — the env block below
+        # already forwards it. `-rs` prints the skip reasons so the CI log
+        # shows what ran and what didn't.
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_MODEL_NAME: ${{ secrets.MLFLOW_MODEL_NAME }}
+          MLFLOW_MODEL_STAGE: ${{ secrets.MLFLOW_MODEL_STAGE }}
+        run: pytest -q -rs
