@@ -9,9 +9,9 @@ y = X[:, 0] * 10 + np.random.randn(100)
 
 # MLflow setup
 mlflow.set_tracking_uri("http://34.133.160.231:5000")
-mlflow.set_experiment('demo-experiment')
+mlflow.set_experiment("demo-experiment")
 
-with mlflow.start_run(run_name='lasso-demo'):
+with mlflow.start_run(run_name="lasso-demo"):
     mlflow.set_tags({"model": "lasso", "dataset": "synthetic"})
 
     lambda_hp = 0.1

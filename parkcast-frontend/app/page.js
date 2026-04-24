@@ -197,11 +197,13 @@ export default function MapPage() {
     blocks.forEach(block => {
       const icon = L.divIcon({
         html: `<div style="
-          background:${block.color};border:2px solid rgba(255,255,255,0.9);
-          border-radius:6px;padding:3px 8px;font-size:11px;font-weight:700;
-          color:white;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,0.35);cursor:pointer;
+          background:${block.color};border:2px solid white;
+          border-radius:50%;width:40px;height:40px;
+          display:flex;align-items:center;justify-content:center;
+          font-size:12px;font-weight:700;
+          color:white;box-shadow:0 2px 6px rgba(0,0,0,0.35);cursor:pointer;
         ">${Math.round(block.predicted_occupancy_pct)}%</div>`,
-        className: '', iconAnchor: [20, 12],
+        className: '', iconAnchor: [20, 20],
       });
 
       const marker = L.marker([block.lat, block.lon], { icon })
@@ -573,30 +575,6 @@ export default function MapPage() {
       {/* ── Map ── */}
       <div style={{ flex: 1, position: 'relative' }}>
         <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
-
-        {/* Legend */}
-        <div style={{
-          position: 'absolute', bottom: 20, right: 16, background: 'rgba(10,21,32,0.92)',
-          border: '1px solid #1e3a52', borderRadius: 8, padding: '10px 14px', zIndex: 1000,
-        }}>
-          <div style={{ fontSize: 10, color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>Occupancy</div>
-          {[['#22c55e','< 40%  Easy'],['#f59e0b','40–70%  Moderate'],['#f97316','70–85%  Hard'],['#ef4444','> 85%  Very Hard']].map(([col, label]) => (
-            <div key={col} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 3 }}>
-              <div style={{ width: 12, height: 12, borderRadius: 3, background: col, flexShrink: 0 }} />
-              <span style={{ fontSize: 11, color: '#cbd5e1' }}>{label}</span>
-            </div>
-          ))}
-          <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid #1e3a52' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 3 }}>
-              <div style={{ width: 12, height: 12, borderRadius: '50%', background: '#3b82f6', flexShrink: 0 }} />
-              <span style={{ fontSize: 11, color: '#cbd5e1' }}>Your location</span>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <div style={{ width: 12, height: 12, borderRadius: '50%', background: '#0d9488', flexShrink: 0 }} />
-              <span style={{ fontSize: 11, color: '#cbd5e1' }}>Destination</span>
-            </div>
-          </div>
-        </div>
 
         {/* Loading overlay */}
         {loading && (

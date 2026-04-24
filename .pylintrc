@@ -1,0 +1,8 @@
+[MASTER]
+ignore=.venv,parkcast-frontend,node_modules,build,dist
+
+[FORMAT]
+max-line-length=120
+
+[MESSAGES CONTROL]
+disable=C0114,C0115,C0116,R0913,R0914,W0718,C0301,R0903
