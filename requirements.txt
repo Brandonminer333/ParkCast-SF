@@ -4,5 +4,8 @@ scikit-learn==1.8.0
 joblib==1.4.2
 numpy==1.26.4
 pandas==2.2.2
+pyarrow>=19.0.0
 pydantic==2.9.0
-mlflow==3.10.1
+lightgbm>=4.5.0
+google-cloud-storage==2.18.2
+requests==2.32.3

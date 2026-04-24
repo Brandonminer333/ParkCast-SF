@@ -10,7 +10,8 @@ PROJECT_ID="parkcast"
 REGION="us-central1"
 SERVICE_NAME="parkcast-api"
 IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
-MLFLOW_URI="http://34.133.160.231:5000"
+GCS_BUCKET="parkcast-bucket"
+GCS_PREFIX="Data/"
 
 echo "=========================================="
 echo "ParkCast SF — Cloud Run Deployment"
@@ -55,7 +56,7 @@ gcloud run deploy ${SERVICE_NAME} \
   --cpu=1 \
   --min-instances=0 \
   --max-instances=10 \
-  --set-env-vars="MLFLOW_TRACKING_URI=${MLFLOW_URI}" \
+  --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=${GCS_PREFIX}" \
   --project=${PROJECT_ID}
 
 # Step 5 — Get the deployed URL
