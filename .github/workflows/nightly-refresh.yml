@@ -1,0 +1,41 @@
+name: Nightly refresh
+
+on:
+  schedule:
+    # 09:00 UTC = 02:00 PT. DataSF transactions are usually posted by ~midnight PT.
+    - cron: "0 9 * * *"
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install --no-cache-dir \
+            fastapi uvicorn pydantic pandas pyarrow numpy scikit-learn \
+            lightgbm joblib requests google-cloud-storage \
+            jupyter nbconvert mlflow optuna
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: parkcast
+
+      - name: Run full refresh pipeline
+        run: bash dev/refresh_all.sh
+        env:
+          MLFLOW_TRACKING_URI: http://34.134.159.106:5000
