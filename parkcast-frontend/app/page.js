@@ -214,8 +214,7 @@ export default function MapPage() {
             <span style="color:${block.color};font-size:20px;font-weight:700">${block.predicted_occupancy_pct}%</span>
             <span style="color:#666;font-size:13px"> occupied</span><br>
             <span style="color:#333;font-size:13px">${block.demand_level} demand</span><br>
-            <span style="color:#555;font-size:12px">~${block.available_spaces_estimate} of ${block.total_spaces} spaces free</span><br>
-            <span style="color:#888;font-size:11px">${block.distance_meters}m from destination</span>
+            <span style="color:#888;font-size:11px">${(block.distance_meters / 1609.344).toFixed(2)} mi from destination</span>
           </div>
         `);
 
@@ -534,7 +533,7 @@ export default function MapPage() {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'white', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{b.street}</div>
                       <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
-                        {b.available_spaces_estimate} spaces free · {b.distance_meters}m away
+                        {(b.distance_meters / 1609.344).toFixed(2)} mi away
                       </div>
                     </div>
                     <div style={{ fontSize: 10, padding: '3px 7px', borderRadius: 4, background: demandBg[b.demand_level] || '#1e3a52', color: b.color, fontWeight: 600, flexShrink: 0 }}>

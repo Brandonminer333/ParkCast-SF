@@ -1,2 +1,11 @@
 *.csv
-__pycache__.DS_Store
+__pycache__/
+*.pyc
+.DS_Store
+data/
+app/models/
+.env
+*.local
+/tmp/parkcast_models/
+node_modules/
+.next/
