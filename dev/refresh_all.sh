@@ -54,7 +54,7 @@ jupyter nbconvert --to notebook --execute --inplace build_inference_parquets.ipy
 
 log "7/8 Retraining LightGBM (train_lightgbm.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace train_lightgbm.ipynb \
-  --ExecutePreprocessor.timeout=1800
+  --ExecutePreprocessor.timeout=5400
 
 cd "$PROJECT_DIR"
 
