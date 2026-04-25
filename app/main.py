@@ -119,18 +119,33 @@ class ModelBundle:
         master_path = os.path.join(src, "master_blocks.parquet")
         if os.path.exists(master_path):
             try:
-                master = pd.read_parquet(master_path)
-                master = master[["lat", "lon", "corridor", "limits"]]
-                self.blocks = self.blocks.merge(master, on=["lat", "lon"], how="left")
-                self.blocks["street"] = self.blocks.apply(
-                    lambda r: (
-                        f"{r['corridor']} ({r['limits']})"
-                        if pd.notna(r.get("corridor")) and pd.notna(r.get("limits"))
-                        else (r.get("corridor") if pd.notna(r.get("corridor")) else None)
-                    ),
-                    axis=1,
+                master = pd.read_parquet(master_path)[["lat", "lon", "corridor", "limits"]].dropna(
+                    subset=["lat", "lon"]
                 )
-                self.blocks = self.blocks.drop(columns=["corridor", "limits"])
+                # blocks.parquet and master_blocks.parquet use different lat/lon
+                # precisions and the rows don't share IDs, so an exact merge
+                # produces 0 matches. Use a KDTree nearest-neighbor join with
+                # a ~50m tolerance instead. SF span is small enough that
+                # treating degrees as a flat plane is fine for matching.
+                from scipy.spatial import cKDTree
+
+                tree = cKDTree(master[["lat", "lon"]].values)
+                dist, idx = tree.query(self.blocks[["lat", "lon"]].values, k=1)
+                near = dist < 0.0005  # ~55m at SF latitude
+                corridor = pd.Series([None] * len(self.blocks))
+                limits = pd.Series([None] * len(self.blocks))
+                corridor.loc[near] = master["corridor"].values[idx[near]]
+                limits.loc[near] = master["limits"].values[idx[near]]
+
+                def _street(c, l):
+                    if pd.notna(c) and pd.notna(l):
+                        return f"{c} ({l})"
+                    if pd.notna(c):
+                        return str(c)
+                    return None
+
+                self.blocks["street"] = [_street(c, l) for c, l in zip(corridor, limits)]
+                logger.info(f"  street enrichment matched {near.sum():,}/{len(self.blocks):,} blocks")
             except Exception as e:
                 logger.warning(f"master_blocks.parquet unreadable ({e}); street will be None")
                 self.blocks["street"] = None
