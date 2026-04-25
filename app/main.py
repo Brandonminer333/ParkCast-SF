@@ -57,8 +57,12 @@ ARTIFACT_FILES = [
     "block_static_features.parquet",
 ]
 
+# Optional: enriches blocks with corridor/limits (street name + cross-streets).
+# Missing in GCS won't break the service; the `street` field just stays None.
+OPTIONAL_ARTIFACT_FILES = ["master_blocks.parquet"]
 
-def _download_from_gcs(bucket: str, prefix: str, files: List[str], dest: str) -> None:
+
+def _download_from_gcs(bucket: str, prefix: str, files: List[str], dest: str, optional: bool = False) -> None:
     from google.cloud import storage  # lazy — local dev doesn't need it
 
     os.makedirs(dest, exist_ok=True)
@@ -66,8 +70,14 @@ def _download_from_gcs(bucket: str, prefix: str, files: List[str], dest: str) ->
     b = client.bucket(bucket)
     for f in files:
         key = f"{prefix}{f}"
-        b.blob(key).download_to_filename(os.path.join(dest, f))
-        logger.info(f"  downloaded gs://{bucket}/{key}")
+        try:
+            b.blob(key).download_to_filename(os.path.join(dest, f))
+            logger.info(f"  downloaded gs://{bucket}/{key}")
+        except Exception as e:
+            if optional:
+                logger.info(f"  skipped optional gs://{bucket}/{key}: {e}")
+            else:
+                raise
 
 
 def _resolve_model_dir() -> str:
@@ -75,6 +85,7 @@ def _resolve_model_dir() -> str:
         try:
             logger.info(f"Fetching artifacts from gs://{GCS_BUCKET}/{GCS_PREFIX} …")
             _download_from_gcs(GCS_BUCKET, GCS_PREFIX, ARTIFACT_FILES, CACHE_DIR)
+            _download_from_gcs(GCS_BUCKET, GCS_PREFIX, OPTIONAL_ARTIFACT_FILES, CACHE_DIR, optional=True)
             return CACHE_DIR
         except Exception as e:  # noqa: BLE001 — any download error → fallback
             logger.warning(f"GCS download failed ({e}); falling back to {LOCAL_MODEL_DIR}")
@@ -100,6 +111,31 @@ class ModelBundle:
         self.block_aggs = pd.read_parquet(os.path.join(src, "LightGBM.block_aggs.parquet"))
         self.static = pd.read_parquet(os.path.join(src, "block_static_features.parquet"))
         self.cit_med = pd.read_parquet(os.path.join(src, "citations_hourly_median.parquet"))
+
+        # Optional enrichment: master_blocks.parquet has human-readable
+        # street names ("corridor") and cross-streets ("limits"). Merge on
+        # (lat, lon); if the file isn't present, `street` stays NaN and the
+        # API returns null for that field.
+        master_path = os.path.join(src, "master_blocks.parquet")
+        if os.path.exists(master_path):
+            try:
+                master = pd.read_parquet(master_path)
+                master = master[["lat", "lon", "corridor", "limits"]]
+                self.blocks = self.blocks.merge(master, on=["lat", "lon"], how="left")
+                self.blocks["street"] = self.blocks.apply(
+                    lambda r: (
+                        f"{r['corridor']} ({r['limits']})"
+                        if pd.notna(r.get("corridor")) and pd.notna(r.get("limits"))
+                        else (r.get("corridor") if pd.notna(r.get("corridor")) else None)
+                    ),
+                    axis=1,
+                )
+                self.blocks = self.blocks.drop(columns=["corridor", "limits"])
+            except Exception as e:
+                logger.warning(f"master_blocks.parquet unreadable ({e}); street will be None")
+                self.blocks["street"] = None
+        else:
+            self.blocks["street"] = None
 
         # Freeze the neighborhood category set to what training saw.
         # Unknown categories at inference become NaN → surrogate splits.
@@ -168,6 +204,7 @@ class BlocksRequest(BaseModel):
 class BlockPrediction(BaseModel):
     lat: float
     lon: float
+    street: Optional[str] = None
     neighborhood: Optional[str] = None
     total_spaces: int
     distance_meters: int
@@ -369,6 +406,7 @@ def predict_blocks(req: BlocksRequest):
             BlockPrediction(
                 lat=float(row["lat"]),
                 lon=float(row["lon"]),
+                street=str(row["street"]) if "street" in row and pd.notna(row.get("street")) else None,
                 neighborhood=str(neigh) if pd.notna(neigh) else None,
                 total_spaces=total,
                 distance_meters=int(row["distance_m"]),

@@ -25,6 +25,7 @@ export default function MapPage() {
   const [error, setError] = useState(null);
   const [selectedBlock, setSelectedBlock] = useState(null);
   const [routeInfo, setRouteInfo] = useState(null);  // {driveMin, walkMin}
+  const [driveSteps, setDriveSteps] = useState([]); // OSRM turn-by-turn steps
   const [bestBlockIndex, setBestBlockIndex] = useState(0);
   const [apiStatus, setApiStatus] = useState(null);
   const [showTimePicker, setShowTimePicker] = useState(false);
@@ -133,11 +134,14 @@ export default function MapPage() {
     if (driveRouteRef.current) driveRouteRef.current.remove();
     if (walkRouteRef.current) walkRouteRef.current.remove();
     setRouteInfo(null);
+    setDriveSteps([]);
 
-    // Drive route: user location → parking block
+    // Drive route: user location → parking block. Calls our /api/route proxy
+    // which uses Mapbox driving-traffic server-side (so the token never ends
+    // up in the browser bundle).
     if (userLocation) {
       try {
-        const driveUrl = `https://router.project-osrm.org/route/v1/driving/${userLocation.lon},${userLocation.lat};${block.lon},${block.lat}?overview=full&geometries=geojson`;
+        const driveUrl = `/api/route?profile=driving-traffic&coords=${userLocation.lon},${userLocation.lat};${block.lon},${block.lat}`;
         const driveRes = await fetch(driveUrl);
         const driveData = await driveRes.json();
         if (driveData.routes && driveData.routes[0]) {
@@ -148,11 +152,16 @@ export default function MapPage() {
           const driveSec = driveData.routes[0].duration;
           const driveMin = Math.ceil(driveSec / 60);
 
+          // Pull turn-by-turn steps from the first (and only) leg.
+          const rawSteps = driveData.routes[0].legs?.[0]?.steps || [];
+          setDriveSteps(rawSteps);
+          const driveMi = driveData.routes[0].distance / 1609.344;
+
           // Walk route: parking block → destination
           let walkMin = null;
           if (destination) {
             try {
-              const walkUrl = `https://router.project-osrm.org/route/v1/foot/${block.lon},${block.lat};${destination.lon},${destination.lat}?overview=full&geometries=geojson`;
+              const walkUrl = `/api/route?profile=walking&coords=${block.lon},${block.lat};${destination.lon},${destination.lat}`;
               const walkRes = await fetch(walkUrl);
               const walkData = await walkRes.json();
               if (walkData.routes && walkData.routes[0]) {
@@ -164,7 +173,7 @@ export default function MapPage() {
               }
             } catch {}
           }
-          setRouteInfo({ driveMin, walkMin });
+          setRouteInfo({ driveMin, walkMin, driveMi });
         }
       } catch {}
     }
@@ -183,6 +192,7 @@ export default function MapPage() {
     if (driveRouteRef.current) driveRouteRef.current.remove();
     if (walkRouteRef.current) walkRouteRef.current.remove();
     setRouteInfo(null);
+    setDriveSteps([]);
     setSelectedBlock(null);
     setBestBlockIndex(0);
   }, [blocks]);
@@ -477,19 +487,38 @@ export default function MapPage() {
             <>
               {routeInfo && selectedBlock && (
                 <div style={{ padding: '10px 16px', background: '#0f2a3a', borderBottom: '1px solid #1e3a52' }}>
-                  <div style={{ display: 'flex', gap: 10, marginBottom: 8 }}>
-                    <div style={{ flex: 1, textAlign: 'center', background: '#112031', borderRadius: 6, padding: '6px 4px' }}>
-                      <div style={{ fontSize: 18, fontWeight: 700, color: '#14b8a6' }}>{routeInfo.driveMin}m</div>
-                      <div style={{ fontSize: 10, color: '#64748b' }}>🚗 drive</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#112031', borderRadius: 6, padding: '8px 12px' }}>
+                      <div style={{ fontSize: 16 }}>🚗</div>
+                      <div style={{ flex: 1, fontSize: 12, color: '#94a3b8' }}>
+                        Drive <span style={{ color: '#cbd5e1' }}>your location</span> → <span style={{ color: '#cbd5e1' }}>parking</span>
+                      </div>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: '#14b8a6' }}>
+                        {routeInfo.driveMin}<span style={{ fontSize: 10, fontWeight: 500, color: '#94a3b8' }}> min</span>
+                      </div>
                     </div>
-                    {routeInfo.walkMin && <div style={{ flex: 1, textAlign: 'center', background: '#112031', borderRadius: 6, padding: '6px 4px' }}>
-                      <div style={{ fontSize: 18, fontWeight: 700, color: '#f8fafc' }}>{routeInfo.walkMin}m</div>
-                      <div style={{ fontSize: 10, color: '#64748b' }}>🚶 walk</div>
-                    </div>}
-                    {routeInfo.walkMin && <div style={{ flex: 1, textAlign: 'center', background: '#112031', borderRadius: 6, padding: '6px 4px' }}>
-                      <div style={{ fontSize: 18, fontWeight: 700, color: '#f59e0b' }}>{routeInfo.driveMin + routeInfo.walkMin}m</div>
-                      <div style={{ fontSize: 10, color: '#64748b' }}>⏱ total</div>
-                    </div>}
+                    {routeInfo.walkMin && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#112031', borderRadius: 6, padding: '8px 12px' }}>
+                        <div style={{ fontSize: 16 }}>🚶</div>
+                        <div style={{ flex: 1, fontSize: 12, color: '#94a3b8' }}>
+                          Walk <span style={{ color: '#cbd5e1' }}>parking</span> → <span style={{ color: '#cbd5e1' }}>destination</span>
+                        </div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: '#f8fafc' }}>
+                          {routeInfo.walkMin}<span style={{ fontSize: 10, fontWeight: 500, color: '#94a3b8' }}> min</span>
+                        </div>
+                      </div>
+                    )}
+                    {routeInfo.walkMin && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#0f1e2d', borderRadius: 6, padding: '8px 12px', border: '1px solid #1e3a52' }}>
+                        <div style={{ fontSize: 16 }}>⏱</div>
+                        <div style={{ flex: 1, fontSize: 12, color: '#94a3b8', fontWeight: 600 }}>
+                          Total trip
+                        </div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: '#f59e0b' }}>
+                          {routeInfo.driveMin + routeInfo.walkMin}<span style={{ fontSize: 10, fontWeight: 500, color: '#94a3b8' }}> min</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <button onClick={() => {
                     const sorted = [...blocks].sort((a,b) => a.predicted_occupancy_pct - b.predicted_occupancy_pct);
@@ -503,13 +532,32 @@ export default function MapPage() {
                   </button>
                 </div>
               )}
-              <div style={{ padding: '8px 16px', fontSize: 10, color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', background: '#0a1520', borderBottom: '1px solid #1e3a52' }}>
-                {blocks.length} blocks nearby · tap to see routes
-              </div>
-              {blocks.map(b => (
-                <div key={b.block_id}
+              {selectedBlock ? (
+                <button onClick={() => {
+                  setSelectedBlock(null);
+                  if (driveRouteRef.current) driveRouteRef.current.remove();
+                  if (walkRouteRef.current) walkRouteRef.current.remove();
+                  setRouteInfo(null);
+                  setDriveSteps([]);
+                }}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    width: '100%', padding: '10px 16px', background: '#0a1520',
+                    border: 'none', borderBottom: '1px solid #1e3a52',
+                    color: '#94a3b8', fontSize: 12, fontWeight: 600,
+                    cursor: 'pointer', textAlign: 'left',
+                  }}>
+                  ← Back to all {blocks.length} blocks
+                </button>
+              ) : (
+                <div style={{ padding: '8px 16px', fontSize: 10, color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', background: '#0a1520', borderBottom: '1px solid #1e3a52' }}>
+                  {blocks.length} blocks nearby · tap to see routes
+                </div>
+              )}
+              {(selectedBlock ? blocks.filter(b => b.lat === selectedBlock.lat && b.lon === selectedBlock.lon) : blocks).map(b => (
+                <div key={`${b.lat},${b.lon}`}
                   onClick={() => {
-                    const isSelected = selectedBlock?.block_id === b.block_id;
+                    const isSelected = selectedBlock?.lat === b.lat && selectedBlock?.lon === b.lon;
                     setSelectedBlock(isSelected ? null : b);
                     if (!isSelected) drawBlockRoutes(b);
                     else {
@@ -520,7 +568,7 @@ export default function MapPage() {
                   }}
                   style={{
                     padding: '10px 16px', borderBottom: '1px solid #0f1e2d', cursor: 'pointer',
-                    background: selectedBlock?.block_id === b.block_id ? '#112031' : 'transparent',
+                    background: selectedBlock?.lat === b.lat && selectedBlock?.lon === b.lon ? '#112031' : 'transparent',
                   }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <div style={{
@@ -541,7 +589,7 @@ export default function MapPage() {
                     </div>
                   </div>
 
-                  {selectedBlock?.block_id === b.block_id && (
+                  {selectedBlock?.lat === b.lat && selectedBlock?.lon === b.lon && (
                     <div style={{ marginTop: 8, padding: '8px 10px', background: '#0d1b2a', borderRadius: 6, fontSize: 12 }}>
                       <div style={{ color: '#94a3b8', lineHeight: 1.5, marginBottom: 10 }}>
                         {b.predicted_occupancy_pct >= 85 && '🔴 Very hard to park — consider public transit or a nearby garage.'}
@@ -550,18 +598,96 @@ export default function MapPage() {
                         {b.predicted_occupancy_pct < 40 && '🟢 Plenty of spaces — easy parking here!'}
                       </div>
 
-                        <a href={`https://www.google.com/maps/dir/?api=1&destination=${b.lat},${b.lon}&travelmode=driving`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          style={{
-                            display: 'block', width: '100%', padding: '9px',
-                            background: '#0d9488', borderRadius: 7, border: 'none',
-                            color: 'white', fontSize: 12, fontWeight: 700,
-                            textAlign: 'center', textDecoration: 'none',
-                            boxSizing: 'border-box',
-                          }}>
-                          Navigate to this parking block →
-                        </a>
+                        {driveSteps.length > 0 && (() => {
+                          const ManeuverIcon = ({ type, modifier, isArrive }) => {
+                            const stroke = isArrive ? 'white' : '#14b8a6';
+                            const common = { width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke, strokeWidth: 2.4, strokeLinecap: 'round', strokeLinejoin: 'round' };
+                            if (isArrive) return (<svg {...common}><circle cx="12" cy="10" r="4" fill="white"/><path d="M12 14v8" stroke="white"/></svg>);
+                            if (type === 'depart') return (<svg {...common}><path d="M12 20V6"/><path d="M5 13l7-7 7 7"/></svg>);
+                            if (type === 'roundabout') return (<svg {...common}><circle cx="12" cy="12" r="5"/><path d="M12 22v-5"/></svg>);
+                            switch (modifier) {
+                              case 'right':       return (<svg {...common}><path d="M5 19V11a4 4 0 0 1 4-4h10"/><path d="M14 2l5 5-5 5"/></svg>);
+                              case 'left':        return (<svg {...common}><path d="M19 19V11a4 4 0 0 0-4-4H5"/><path d="M10 2L5 7l5 5"/></svg>);
+                              case 'sharp right': return (<svg {...common}><path d="M6 21V13a3 3 0 0 1 3-3h11"/><path d="M15 5l5 5-5 5"/></svg>);
+                              case 'sharp left':  return (<svg {...common}><path d="M18 21V13a3 3 0 0 0-3-3H4"/><path d="M9 5l-5 5 5 5"/></svg>);
+                              case 'slight right':return (<svg {...common}><path d="M7 22V11c0-3 2-5 5-5h6"/><path d="M14 2l5 4-5 4"/></svg>);
+                              case 'slight left': return (<svg {...common}><path d="M17 22V11c0-3-2-5-5-5H6"/><path d="M10 2L5 6l5 4"/></svg>);
+                              case 'uturn':       return (<svg {...common}><path d="M5 21v-9a5 5 0 0 1 10 0v6"/><path d="M19 16l-4 4-4-4"/></svg>);
+                              case 'straight':    return (<svg {...common}><path d="M12 22V4"/><path d="M5 11l7-7 7 7"/></svg>);
+                              default:            return (<svg {...common}><circle cx="12" cy="12" r="2.5" fill={stroke}/></svg>);
+                            }
+                          };
+                          return (
+                            <div style={{
+                              marginBottom: 12,
+                              background: '#0a1422',
+                              borderRadius: 10,
+                              border: '1px solid #1e293b',
+                              overflow: 'hidden',
+                            }}>
+                              <div style={{
+                                padding: '12px 14px',
+                                borderBottom: '1px solid #1e293b',
+                                display: 'flex', alignItems: 'baseline', gap: 8,
+                              }}>
+                                <div style={{ fontSize: 18, fontWeight: 700, color: '#f8fafc' }}>
+                                  {routeInfo?.driveMin}<span style={{ fontSize: 12, fontWeight: 500, color: '#94a3b8' }}> min</span>
+                                </div>
+                                <div style={{ color: '#475569', fontSize: 11 }}>·</div>
+                                <div style={{ fontSize: 13, color: '#94a3b8' }}>
+                                  {routeInfo?.driveMi != null ? `${routeInfo.driveMi.toFixed(1)} mi` : ''}
+                                </div>
+                                <div style={{ marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: '#64748b', letterSpacing: 1.2 }}>
+                                  DRIVE
+                                </div>
+                              </div>
+                              <div style={{ maxHeight: 240, overflowY: 'auto' }}>
+                                {driveSteps.map((s, i) => {
+                                  const m = s.maneuver || {};
+                                  const isArrive = m.type === 'arrive';
+                                  const isDepart = m.type === 'depart';
+                                  const street = s.name || s.ref || '';
+                                  let verb, target;
+                                  if (isDepart) { verb = 'Head'; target = street ? `onto ${street}` : ''; }
+                                  else if (isArrive) { verb = 'Arrive at'; target = street || 'destination'; }
+                                  else if (m.type === 'roundabout') { verb = 'Take the roundabout'; target = street ? `to ${street}` : ''; }
+                                  else if (m.modifier) { verb = `Turn ${m.modifier}`; target = street ? `onto ${street}` : ''; }
+                                  else { verb = 'Continue'; target = street ? `on ${street}` : ''; }
+                                  const distMi = s.distance / 1609.344;
+                                  const dist = distMi < 0.1 ? `${distMi.toFixed(2)} mi` : `${distMi.toFixed(1)} mi`;
+                                  return (
+                                    <div key={i} style={{
+                                      display: 'flex', alignItems: 'center', gap: 12,
+                                      padding: '12px 14px',
+                                      borderTop: i === 0 ? 'none' : '1px solid #122033',
+                                    }}>
+                                      <div style={{
+                                        width: 36, height: 36, borderRadius: 999,
+                                        background: isArrive ? '#0d9488' : '#0f2031',
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                        flexShrink: 0,
+                                      }}>
+                                        <ManeuverIcon type={m.type} modifier={m.modifier} isArrive={isArrive} />
+                                      </div>
+                                      <div style={{ flex: 1, minWidth: 0 }}>
+                                        <div style={{
+                                          fontSize: 13, lineHeight: 1.35, color: '#f1f5f9',
+                                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                                        }}>
+                                          <span style={{ fontWeight: 700 }}>{verb}</span>
+                                          {target && <span style={{ color: '#cbd5e1', fontWeight: 500 }}> {target}</span>}
+                                        </div>
+                                        {!isArrive && (
+                                          <div style={{ fontSize: 11.5, color: '#64748b', marginTop: 2 }}>{dist}</div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
                 </div>
