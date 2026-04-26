@@ -57,9 +57,18 @@ ARTIFACT_FILES = [
     "block_static_features.parquet",
 ]
 
-# Optional: enriches blocks with corridor/limits (street name + cross-streets).
-# Missing in GCS won't break the service; the `street` field just stays None.
-OPTIONAL_ARTIFACT_FILES = ["master_blocks.parquet"]
+# Optional: enriches blocks with corridor/limits (street name + cross-streets)
+# and provides per-neighborhood (hour, dow) fallback baselines for inferred
+# (non-metered) blocks. Missing in GCS won't break the service.
+OPTIONAL_ARTIFACT_FILES = [
+    "master_blocks.parquet",
+    "neighborhood_hour_dow_aggs.parquet",
+]
+
+# Cap on rows returned by /predict/blocks. The served universe is now
+# citywide (~12.7k blockfaces), so a 2km radius can match thousands; the
+# frontend map gets unusable above a few hundred markers.
+MAX_BLOCKS_RETURNED = 200
 
 
 def _download_from_gcs(bucket: str, prefix: str, files: List[str], dest: str, optional: bool = False) -> None:
@@ -111,6 +120,18 @@ class ModelBundle:
         self.block_aggs = pd.read_parquet(os.path.join(src, "LightGBM.block_aggs.parquet"))
         self.static = pd.read_parquet(os.path.join(src, "block_static_features.parquet"))
         self.cit_med = pd.read_parquet(os.path.join(src, "citations_hourly_median.parquet"))
+
+        # Neighborhood-level (hour, dow) aggregates — fallback baseline for
+        # inferred (non-metered) blocks that aren't keyed in block_aggs.
+        # Optional: older bundles without this file degrade to global_mean.
+        nbh_path = os.path.join(src, "neighborhood_hour_dow_aggs.parquet")
+        self.nbh_aggs: Optional[pd.DataFrame] = pd.read_parquet(nbh_path) if os.path.exists(nbh_path) else None
+
+        # `coverage` was added when blocks.parquet went citywide. Older
+        # metered-only bundles don't have it; default everything to "metered"
+        # so existing clients keep working.
+        if "coverage" not in self.blocks.columns:
+            self.blocks["coverage"] = "metered"
 
         # Optional enrichment: master_blocks.parquet has human-readable
         # street names ("corridor") and cross-streets ("limits"). Merge on
@@ -227,6 +248,9 @@ class BlockPrediction(BaseModel):
     available_spaces_estimate: int
     demand_level: str
     color: str
+    # "metered"  — block has SFpark training labels, prediction is direct
+    # "inferred" — non-metered blockface, prediction via neighborhood baseline
+    coverage: str = "metered"
 
 
 class BlocksResponse(BaseModel):
@@ -340,6 +364,24 @@ def _build_features(
     df = df.merge(bundle.static, on=["lat", "lon"], how="left")
     df = df.merge(bundle.cit_med, on=["hour", "day_of_week"], how="left")
 
+    # Inferred (non-metered) blocks miss the per-(lat, lon) join above. Fill
+    # the resulting NaNs with the block's neighborhood-(hour, dow) mean
+    # before the global-mean fallback. Must run while neighborhood is still a
+    # plain string — the categorical cast below would block the merge.
+    if bundle.nbh_aggs is not None:
+        nbh = bundle.nbh_aggs.rename(
+            columns={
+                "block_hour_dow_mean": "_nbh_bhd",
+                "block_hour_mean": "_nbh_bh",
+                "block_mean": "_nbh_bm",
+            }
+        )
+        df = df.merge(nbh, on=["neighborhood", "hour", "day_of_week"], how="left")
+        df["block_hour_dow_mean"] = df["block_hour_dow_mean"].fillna(df["_nbh_bhd"])
+        df["block_hour_mean"] = df["block_hour_mean"].fillna(df["_nbh_bh"])
+        df["block_mean"] = df["block_mean"].fillna(df["_nbh_bm"])
+        df = df.drop(columns=["_nbh_bhd", "_nbh_bh", "_nbh_bm"])
+
     # Lags stay NaN: lag_history ends at the training split and no live feed
     # is wired yet. LightGBM uses surrogate splits for missing features.
     for col in LAG_COLS:
@@ -408,6 +450,10 @@ def predict_blocks(req: BlocksRequest):
         # still gets a usable answer.
         nearby = blocks.sort_values("distance_m").head(8)
 
+    # Cap the result list — the citywide universe makes it possible to match
+    # thousands of blocks within a 2km radius downtown.
+    nearby = nearby.head(MAX_BLOCKS_RETURNED)
+
     feat_df = _build_features(nearby, target_hour, req, BUNDLE)
     preds = _predict_rows(feat_df, BUNDLE)
 
@@ -429,6 +475,7 @@ def predict_blocks(req: BlocksRequest):
                 available_spaces_estimate=avail,
                 demand_level=_demand_level(pct),
                 color=_color(pct),
+                coverage=str(row["coverage"]) if "coverage" in row and pd.notna(row.get("coverage")) else "metered",
             )
         )
 
