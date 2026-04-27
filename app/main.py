@@ -58,11 +58,12 @@ ARTIFACT_FILES = [
 ]
 
 # Optional: enriches blocks with corridor/limits (street name + cross-streets)
-# and provides per-neighborhood (hour, dow) fallback baselines for inferred
-# (non-metered) blocks. Missing in GCS won't break the service.
+# and provides per-cnn (hour, dow) fallback baselines for inferred (non-metered)
+# blocks — distance-weighted KNN over the K=5 nearest metered blocks. Missing
+# in GCS won't break the service.
 OPTIONAL_ARTIFACT_FILES = [
     "master_blocks.parquet",
-    "neighborhood_hour_dow_aggs.parquet",
+    "inferred_block_aggs.parquet",
 ]
 
 # Cap on rows returned by /predict/blocks. The served universe is now
@@ -121,11 +122,15 @@ class ModelBundle:
         self.static = pd.read_parquet(os.path.join(src, "block_static_features.parquet"))
         self.cit_med = pd.read_parquet(os.path.join(src, "citations_hourly_median.parquet"))
 
-        # Neighborhood-level (hour, dow) aggregates — fallback baseline for
-        # inferred (non-metered) blocks that aren't keyed in block_aggs.
+        # Per-cnn (hour, dow) baselines for inferred blocks — distance-weighted
+        # KNN over the K=5 nearest metered blocks (built in
+        # dev/build_full_blocks.ipynb). Each inferred block's baseline reflects
+        # the local metered behavior, not a flat neighborhood average.
         # Optional: older bundles without this file degrade to global_mean.
-        nbh_path = os.path.join(src, "neighborhood_hour_dow_aggs.parquet")
-        self.nbh_aggs: Optional[pd.DataFrame] = pd.read_parquet(nbh_path) if os.path.exists(nbh_path) else None
+        inferred_path = os.path.join(src, "inferred_block_aggs.parquet")
+        self.inferred_aggs: Optional[pd.DataFrame] = (
+            pd.read_parquet(inferred_path) if os.path.exists(inferred_path) else None
+        )
 
         # `coverage` was added when blocks.parquet went citywide. Older
         # metered-only bundles don't have it; default everything to "metered"
@@ -365,22 +370,23 @@ def _build_features(
     df = df.merge(bundle.cit_med, on=["hour", "day_of_week"], how="left")
 
     # Inferred (non-metered) blocks miss the per-(lat, lon) join above. Fill
-    # the resulting NaNs with the block's neighborhood-(hour, dow) mean
-    # before the global-mean fallback. Must run while neighborhood is still a
-    # plain string — the categorical cast below would block the merge.
-    if bundle.nbh_aggs is not None:
-        nbh = bundle.nbh_aggs.rename(
+    # the resulting NaNs with this block's KNN-derived per-(cnn, hour, dow)
+    # baseline (distance-weighted average of the K=5 nearest metered blocks)
+    # before the global-mean fallback. cnn is populated only on inferred rows
+    # so this is effectively a left-join scoped to that subset.
+    if bundle.inferred_aggs is not None and "cnn" in df.columns:
+        infa = bundle.inferred_aggs.rename(
             columns={
-                "block_hour_dow_mean": "_nbh_bhd",
-                "block_hour_mean": "_nbh_bh",
-                "block_mean": "_nbh_bm",
+                "block_hour_dow_mean": "_inf_bhd",
+                "block_hour_mean": "_inf_bh",
+                "block_mean": "_inf_bm",
             }
         )
-        df = df.merge(nbh, on=["neighborhood", "hour", "day_of_week"], how="left")
-        df["block_hour_dow_mean"] = df["block_hour_dow_mean"].fillna(df["_nbh_bhd"])
-        df["block_hour_mean"] = df["block_hour_mean"].fillna(df["_nbh_bh"])
-        df["block_mean"] = df["block_mean"].fillna(df["_nbh_bm"])
-        df = df.drop(columns=["_nbh_bhd", "_nbh_bh", "_nbh_bm"])
+        df = df.merge(infa, on=["cnn", "hour", "day_of_week"], how="left")
+        df["block_hour_dow_mean"] = df["block_hour_dow_mean"].fillna(df["_inf_bhd"])
+        df["block_hour_mean"] = df["block_hour_mean"].fillna(df["_inf_bh"])
+        df["block_mean"] = df["block_mean"].fillna(df["_inf_bm"])
+        df = df.drop(columns=["_inf_bhd", "_inf_bh", "_inf_bm"])
 
     # Lags stay NaN: lag_history ends at the training split and no live feed
     # is wired yet. LightGBM uses surrogate splits for missing features.
