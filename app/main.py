@@ -138,30 +138,21 @@ class ModelBundle:
         if "coverage" not in self.blocks.columns:
             self.blocks["coverage"] = "metered"
 
-        # Optional enrichment: master_blocks.parquet has human-readable
-        # street names ("corridor") and cross-streets ("limits"). Merge on
-        # (lat, lon); if the file isn't present, `street` stays NaN and the
-        # API returns null for that field.
+        # Street label enrichment: cnn-keyed merge against master_blocks.
+        # build_full_blocks.ipynb populates `cnn` on every block (including
+        # metered ones via spatial-join), so an exact key merge replaces the
+        # older KDTree-with-tolerance fallback that missed ~1.3% of long
+        # downtown blocks. Falls back to None if master_blocks isn't present.
+        self.blocks["street"] = None
         master_path = os.path.join(src, "master_blocks.parquet")
-        if os.path.exists(master_path):
+        if os.path.exists(master_path) and "cnn" in self.blocks.columns:
             try:
-                master = pd.read_parquet(master_path)[["lat", "lon", "corridor", "limits"]].dropna(
-                    subset=["lat", "lon"]
-                )
-                # blocks.parquet and master_blocks.parquet use different lat/lon
-                # precisions and the rows don't share IDs, so an exact merge
-                # produces 0 matches. Use a KDTree nearest-neighbor join with
-                # a ~50m tolerance instead. SF span is small enough that
-                # treating degrees as a flat plane is fine for matching.
-                from scipy.spatial import cKDTree
-
-                tree = cKDTree(master[["lat", "lon"]].values)
-                dist, idx = tree.query(self.blocks[["lat", "lon"]].values, k=1)
-                near = dist < 0.0005  # ~55m at SF latitude
-                corridor = pd.Series([None] * len(self.blocks))
-                limits = pd.Series([None] * len(self.blocks))
-                corridor.loc[near] = master["corridor"].values[idx[near]]
-                limits.loc[near] = master["limits"].values[idx[near]]
+                master = pd.read_parquet(master_path)[["cnn", "corridor", "limits"]].dropna(subset=["cnn"])
+                master["cnn"] = master["cnn"].astype("Int64")
+                blocks_cnn = self.blocks["cnn"].astype("Int64")
+                lookup = master.set_index("cnn")
+                corridors = blocks_cnn.map(lookup["corridor"])
+                limits = blocks_cnn.map(lookup["limits"])
 
                 def _street(c, l):
                     if pd.notna(c) and pd.notna(l):
@@ -170,13 +161,11 @@ class ModelBundle:
                         return str(c)
                     return None
 
-                self.blocks["street"] = [_street(c, l) for c, l in zip(corridor, limits)]
-                logger.info(f"  street enrichment matched {near.sum():,}/{len(self.blocks):,} blocks")
+                self.blocks["street"] = [_street(c, l) for c, l in zip(corridors, limits)]
+                matched = self.blocks["street"].notna().sum()
+                logger.info(f"  street enrichment matched {matched:,}/{len(self.blocks):,} blocks (cnn join)")
             except Exception as e:
                 logger.warning(f"master_blocks.parquet unreadable ({e}); street will be None")
-                self.blocks["street"] = None
-        else:
-            self.blocks["street"] = None
 
         # Freeze the neighborhood category set to what training saw.
         # Unknown categories at inference become NaN → surrogate splits.
