@@ -1,37 +1,29 @@
 """
-ParkCast SF — FastAPI Service
+ParkCast SF — FastAPI inference service.
 
-Serves the parkcast-frontend UI (https://parkcast-frontend.vercel.app).
+Loads the LightGBM residual model + per-block lookup parquets from GCS at
+startup (falls back to local `app/models/` for dev). Every request builds
+the full 33-feature matrix the model was trained on; lags are NaN at
+inference (training lag_history ends at the temporal split — LightGBM uses
+surrogate splits for missing features).
 
-Public endpoints:
-  GET  /                  → welcome / endpoint map
-  GET  /health            → liveness + asset summary
-  POST /predict/blocks    → block-by-block occupancy forecast around a lat/lon
+Env vars:
+  GCS_BUCKET   — bucket name. If unset, loads from local app/models/.
+  GCS_PREFIX   — optional key prefix inside the bucket (e.g. "Data/"). Must
+                 end with "/" or be empty.
 
-The frontend calls /health on load and /predict/blocks when the user taps
-"Find Parking". Everything else the browser needs (geocoding, routing,
-weather) is fetched directly from third-party services (Nominatim/OSRM/
-Open-Meteo) and does not go through this API.
-
-The prediction stack is the hybrid LightGBM model trained in
-dev/train_lightgbm.ipynb. At inference:
-
-  final_occupancy = clip(block_hour_dow_mean + LightGBM_residual, 0, 100)
-
-where `block_hour_dow_mean` is a per-block historical baseline and the
-LightGBM residual is learned over SFpark meter-hour data. Weather is
-pulled from Open-Meteo on demand, cached by day.
+Endpoints:
+  GET  /                → service info
+  GET  /health          → model-loaded check + metrics
+  POST /predict         → single aggregate prediction for a neighborhood
+  POST /predict/blocks  → block-by-block predictions around (lat, lon)
+  GET  /geocode_proxy   → Nominatim address lookup
 """
 
-from __future__ import annotations
-
 import json
+import logging
 import math
 import os
-import urllib.request
-from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
-from functools import lru_cache
 from typing import List, Optional
 
 import joblib
@@ -41,568 +33,221 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ── Paths ────────────────────────────────────────────────────────────────────
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(APP_DIR, "models")
-DATA_DIR = os.path.join(os.path.dirname(APP_DIR), "data")
-
-MODEL_PATH = os.path.join(MODEL_DIR, "LightGBM.pkl")
-BLOCK_AGG_PATH = os.path.join(MODEL_DIR, "LightGBM.block_aggs.parquet")
-BLOCKS_PATH = os.path.join(MODEL_DIR, "blocks.parquet")
-MASTER_PATH = os.path.join(MODEL_DIR, "master_blocks.parquet")
-LAG_PATH = os.path.join(MODEL_DIR, "lag_history.parquet")
-CIT_LOOKUP_PATH = os.path.join(MODEL_DIR, "citations_hourly_median.parquet")
-META_PATH = os.path.join(MODEL_DIR, "LightGBM.meta.json")
-EVENTS_PATH = os.path.join(DATA_DIR, "events.csv")
-
-# Per-block inference lookups built by `dev/build_block_lookups.py` from
-# `dev/processed_training_data.csv`. They let inference populate the static
-# and hour/dow-aggregate features the model was trained against.
-BLOCK_STATIC_PATH = os.path.join(MODEL_DIR, "block_static.parquet")
-COMPLAINTS_LOOKUP_PATH = os.path.join(MODEL_DIR, "complaints_lookup.parquet")
-SFPARK_LOOKUP_PATH = os.path.join(MODEL_DIR, "sfpark_lookup.parquet")
-
-# ── Model source ─────────────────────────────────────────────────────────────
-# Production loads the champion from the MLflow registry; local dev (or CI
-# without registry access) falls back to the legacy `joblib` artifact.
-MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "").strip()
-MLFLOW_MODEL_NAME = os.environ.get("MLFLOW_MODEL_NAME", "parkcast-occupancy-model")
-MLFLOW_MODEL_STAGE = os.environ.get("MLFLOW_MODEL_STAGE", "champion")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-# ── Feature schema ───────────────────────────────────────────────────────────
-# `FEATURES_SUPERSET_NUMERIC` lists every numeric column `build_feature_row`
-# knows how to produce. The `FEATURES` list that actually gets handed to the
-# model is derived at startup from `model.booster_.feature_name()` (see
-# `_load_all`), so that both the legacy 31-feature local model and the newer
-# 33-feature MLflow champion (which adds `lag_3d_mean` + `lag_7d_mean`) work
-# without code changes.
-FEATURES_SUPERSET_NUMERIC = [
-    "hour",
-    "day_of_week",
-    "month",
-    "is_weekend",
-    "is_holiday",
-    "is_school_day",
-    "is_raining",
-    "temperature",
-    "event_intensity",
-    "citation_count",
-    "citations_hourly_median",
-    "complaints_311_median",
-    "complaints_311_total",
-    "poi_dining_200m",
-    "poi_retail_200m",
-    "poi_transit_200m",
-    "poi_attraction_200m",
-    "sfpark_block_occ",
-    "permit_active",
-    "permit_count_30d",
-    "lat",
-    "lon",
-    "total_spaces",
-    "block_mean",
-    "block_hour_mean",
-    "lag_1d",
-    "lag_2d",
-    "lag_7d",
-    "lag_14d",
-    "lag_28d",
-    "lag_3d_mean",
-    "lag_7d_mean",
+# ── Artifact location ──────────────────────────────────────────────
+GCS_BUCKET = os.getenv("GCS_BUCKET", "").strip()
+GCS_PREFIX = os.getenv("GCS_PREFIX", "").strip()
+if GCS_PREFIX and not GCS_PREFIX.endswith("/"):
+    GCS_PREFIX += "/"
+
+LOCAL_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+CACHE_DIR = os.getenv("PARKCAST_CACHE_DIR", "/tmp/parkcast_models")
+
+ARTIFACT_FILES = [
+    "LightGBM.pkl",
+    "LightGBM.block_aggs.parquet",
+    "LightGBM.meta.json",
+    "blocks.parquet",
+    "lag_history.parquet",
+    "citations_hourly_median.parquet",
+    "sfpark_calibration.parquet",
+    "block_static_features.parquet",
 ]
-FEATURES_CATEGORICAL = ["neighborhood"]
-FEATURES_SUPERSET = FEATURES_SUPERSET_NUMERIC + FEATURES_CATEGORICAL
 
-# Populated in `_load_all`; default keeps the legacy inference path working.
-FEATURES_NUMERIC: List[str] = list(FEATURES_SUPERSET_NUMERIC)
-FEATURES: List[str] = list(FEATURES_SUPERSET)
+# Optional: enriches blocks with corridor/limits (street name + cross-streets)
+# and provides per-cnn (hour, dow) fallback baselines for inferred (non-metered)
+# blocks — distance-weighted KNN over the K=5 nearest metered blocks. Missing
+# in GCS won't break the service.
+OPTIONAL_ARTIFACT_FILES = [
+    "master_blocks.parquet",
+    "inferred_block_aggs.parquet",
+]
 
-US_HOLIDAYS = {
-    date(2025, 1, 1),
-    date(2025, 1, 20),
-    date(2025, 2, 17),
-    date(2025, 5, 26),
-    date(2025, 6, 19),
-    date(2025, 7, 4),
-    date(2025, 9, 1),
-    date(2025, 10, 13),
-    date(2025, 11, 11),
-    date(2025, 11, 27),
-    date(2025, 12, 25),
-    date(2026, 1, 1),
-    date(2026, 1, 19),
-    date(2026, 2, 16),
-    date(2026, 5, 25),
-    date(2026, 6, 19),
-    date(2026, 7, 4),
-    date(2026, 9, 7),
-    date(2026, 10, 12),
-    date(2026, 11, 11),
-    date(2026, 11, 26),
-    date(2026, 12, 25),
-}
+# Cap on rows returned by /predict/blocks. The served universe is now
+# citywide (~12.7k blockfaces), so a 2km radius can match thousands; the
+# frontend map gets unusable above a few hundred markers.
+MAX_BLOCKS_RETURNED = 200
 
 
-# ── Globals populated at startup ─────────────────────────────────────────────
-model = None
-block_aggs: Optional[pd.DataFrame] = None
-blocks: Optional[pd.DataFrame] = None
-master: Optional[pd.DataFrame] = None
-lag_hist: Optional[pd.DataFrame] = None
-cit_lookup: Optional[pd.DataFrame] = None
-events: Optional[pd.DataFrame] = None
-block_static: Optional[pd.DataFrame] = None
-complaints_lookup: Optional[pd.DataFrame] = None
-sfpark_lookup: Optional[pd.DataFrame] = None
-meta: dict = {}
-global_baseline_mean: float = 50.0
-model_source: str = "unloaded"
+def _download_from_gcs(bucket: str, prefix: str, files: List[str], dest: str, optional: bool = False) -> None:
+    from google.cloud import storage  # lazy — local dev doesn't need it
+
+    os.makedirs(dest, exist_ok=True)
+    client = storage.Client()
+    b = client.bucket(bucket)
+    for f in files:
+        key = f"{prefix}{f}"
+        try:
+            b.blob(key).download_to_filename(os.path.join(dest, f))
+            logger.info(f"  downloaded gs://{bucket}/{key}")
+        except Exception as e:
+            if optional:
+                logger.info(f"  skipped optional gs://{bucket}/{key}: {e}")
+            else:
+                raise
 
 
-def _load_model():
-    """Return (estimator, source_label). Prefers the MLflow champion when
-    `MLFLOW_TRACKING_URI` is set, otherwise falls back to the local legacy
-    joblib artifact."""
-    if MLFLOW_TRACKING_URI:
-        import mlflow  # lazy — mlflow is optional in local dev
-        import mlflow.sklearn
-
-        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-        mlflow.set_registry_uri(MLFLOW_TRACKING_URI)
-        uri = f"models:/{MLFLOW_MODEL_NAME}@{MLFLOW_MODEL_STAGE}"
-        loaded = mlflow.sklearn.load_model(uri)
-        return loaded, f"mlflow:{uri}"
-
-    if os.path.exists(MODEL_PATH):
-        return joblib.load(MODEL_PATH), f"joblib:{MODEL_PATH}"
-
-    return None, "unavailable"
-
-
-def _model_feature_order(loaded) -> Optional[List[str]]:
-    """Return the feature order the trained booster expects, if discoverable."""
-    booster = getattr(loaded, "booster_", None)
-    if booster is not None and hasattr(booster, "feature_name"):
-        names = list(booster.feature_name())
-        if names:
-            return names
-    names = getattr(loaded, "feature_name_", None)
-    if names:
-        return list(names)
-    return None
-
-
-def _load_all() -> None:
-    """Load model + lookup tables into module globals. Missing optional assets
-    (events, master catalog) degrade gracefully; missing required assets
-    leave `model` as None and /health will report 503."""
-    global model, block_aggs, blocks, master, lag_hist, cit_lookup, events
-    global block_static, complaints_lookup, sfpark_lookup
-    global meta, global_baseline_mean, model_source
-    global FEATURES, FEATURES_NUMERIC
-
-    model, model_source = _load_model()
-
-    if model is not None:
-        expected = _model_feature_order(model)
-        if expected:
-            FEATURES = expected
-            FEATURES_NUMERIC = [f for f in expected if f not in FEATURES_CATEGORICAL]
-
-    block_aggs = pd.read_parquet(BLOCK_AGG_PATH)
-    blocks = pd.read_parquet(BLOCKS_PATH)
-    lag_hist = (
-        pd.read_parquet(LAG_PATH).sort_values(["lat", "lon", "timestamp"]).reset_index(drop=True)
-    )
-    cit_lookup = pd.read_parquet(CIT_LOOKUP_PATH)
-
-    if os.path.exists(BLOCK_STATIC_PATH):
-        block_static = pd.read_parquet(BLOCK_STATIC_PATH)
-    if os.path.exists(COMPLAINTS_LOOKUP_PATH):
-        complaints_lookup = pd.read_parquet(COMPLAINTS_LOOKUP_PATH)
-    if os.path.exists(SFPARK_LOOKUP_PATH):
-        sfpark_lookup = pd.read_parquet(SFPARK_LOOKUP_PATH)
-
-    if os.path.exists(MASTER_PATH):
-        master = pd.read_parquet(MASTER_PATH)
-
-    if os.path.exists(EVENTS_PATH):
-        events = pd.read_csv(EVENTS_PATH, parse_dates=["date"])
+def _resolve_model_dir() -> str:
+    if GCS_BUCKET:
+        try:
+            logger.info(f"Fetching artifacts from gs://{GCS_BUCKET}/{GCS_PREFIX} …")
+            _download_from_gcs(GCS_BUCKET, GCS_PREFIX, ARTIFACT_FILES, CACHE_DIR)
+            _download_from_gcs(GCS_BUCKET, GCS_PREFIX, OPTIONAL_ARTIFACT_FILES, CACHE_DIR, optional=True)
+            return CACHE_DIR
+        except Exception as e:  # noqa: BLE001 — any download error → fallback
+            logger.warning(f"GCS download failed ({e}); falling back to {LOCAL_MODEL_DIR}")
     else:
-        events = pd.DataFrame(columns=["date", "venue_lat", "venue_lon", "start_hour", "end_hour"])
-
-    if os.path.exists(META_PATH):
-        with open(META_PATH, encoding="utf-8") as f:
-            meta = json.load(f)
-            global_baseline_mean = float(meta.get("global_mean", 50.0))
+        logger.info(f"GCS_BUCKET unset; loading from {LOCAL_MODEL_DIR}")
+    return LOCAL_MODEL_DIR
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    _load_all()
-    yield
+# ── Model bundle ───────────────────────────────────────────────────
+class ModelBundle:
+    """Model + every lookup parquet inference needs, loaded once at startup."""
+
+    def __init__(self, src: str):
+        self.src = src
+
+        self.model = joblib.load(os.path.join(src, "LightGBM.pkl"))
+        with open(os.path.join(src, "LightGBM.meta.json")) as f:
+            self.meta = json.load(f)
+        self.features: List[str] = self.meta["features"]
+        self.global_mean: float = float(self.meta.get("global_mean", 45.0))
+
+        self.blocks = pd.read_parquet(os.path.join(src, "blocks.parquet"))
+        self.block_aggs = pd.read_parquet(os.path.join(src, "LightGBM.block_aggs.parquet"))
+        self.static = pd.read_parquet(os.path.join(src, "block_static_features.parquet"))
+        self.cit_med = pd.read_parquet(os.path.join(src, "citations_hourly_median.parquet"))
+
+        # Per-cnn (hour, dow) baselines for inferred blocks — distance-weighted
+        # KNN over the K=5 nearest metered blocks (built in
+        # dev/build_full_blocks.ipynb). Each inferred block's baseline reflects
+        # the local metered behavior, not a flat neighborhood average.
+        # Optional: older bundles without this file degrade to global_mean.
+        inferred_path = os.path.join(src, "inferred_block_aggs.parquet")
+        self.inferred_aggs: Optional[pd.DataFrame] = (
+            pd.read_parquet(inferred_path) if os.path.exists(inferred_path) else None
+        )
+
+        # `coverage` was added when blocks.parquet went citywide. Older
+        # metered-only bundles don't have it; default everything to "metered"
+        # so existing clients keep working.
+        if "coverage" not in self.blocks.columns:
+            self.blocks["coverage"] = "metered"
+
+        # Street label enrichment: cnn-keyed merge against master_blocks.
+        # build_full_blocks.ipynb populates `cnn` on every block (including
+        # metered ones via spatial-join), so an exact key merge replaces the
+        # older KDTree-with-tolerance fallback that missed ~1.3% of long
+        # downtown blocks. Falls back to None if master_blocks isn't present.
+        self.blocks["street"] = None
+        master_path = os.path.join(src, "master_blocks.parquet")
+        if os.path.exists(master_path) and "cnn" in self.blocks.columns:
+            try:
+                master = pd.read_parquet(master_path)[["cnn", "corridor", "limits"]].dropna(subset=["cnn"])
+                master["cnn"] = master["cnn"].astype("Int64")
+                blocks_cnn = self.blocks["cnn"].astype("Int64")
+                lookup = master.set_index("cnn")
+                corridors = blocks_cnn.map(lookup["corridor"])
+                limits = blocks_cnn.map(lookup["limits"])
+
+                def _street(c, l):
+                    if pd.notna(c) and pd.notna(l):
+                        return f"{c} ({l})"
+                    if pd.notna(c):
+                        return str(c)
+                    return None
+
+                self.blocks["street"] = [_street(c, l) for c, l in zip(corridors, limits)]
+                matched = self.blocks["street"].notna().sum()
+                logger.info(f"  street enrichment matched {matched:,}/{len(self.blocks):,} blocks (cnn join)")
+            except Exception as e:
+                logger.warning(f"master_blocks.parquet unreadable ({e}); street will be None")
+
+        # Freeze the neighborhood category set to what training saw.
+        # Unknown categories at inference become NaN → surrogate splits.
+        neighborhoods = sorted(self.blocks["neighborhood"].dropna().unique().tolist())
+        self.neighborhood_dtype = pd.CategoricalDtype(categories=neighborhoods)
+
+        logger.info(f"ModelBundle loaded from {src}: " f"{len(self.blocks):,} blocks · {len(self.features)} features")
 
 
-# ── FastAPI app ──────────────────────────────────────────────────────────────
+BUNDLE: Optional[ModelBundle] = None
+try:
+    BUNDLE = ModelBundle(_resolve_model_dir())
+except Exception as e:  # noqa: BLE001
+    logger.error(f"❌ Failed to load ModelBundle: {e}")
+
+
+# ── FastAPI app ────────────────────────────────────────────────────
 app = FastAPI(
     title="ParkCast SF API",
-    description="Block-by-block parking occupancy forecasts for San Francisco.",
-    version="2.0.0",
-    lifespan=lifespan,
+    description="Block-level parking occupancy predictions for San Francisco.",
+    version="3.0.0",
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Weather: on-demand Open-Meteo with daily cache ───────────────────────────
-@lru_cache(maxsize=256)
-def _weather_day(day_iso: str) -> Optional[dict]:
-    """SF hourly temperature (°F) + precipitation for `day_iso`.
-    Returns {hour: (temp_f, is_raining)} or None on failure."""
-    url = (
-        "https://api.open-meteo.com/v1/forecast?"
-        "latitude=37.7749&longitude=-122.4194"
-        f"&start_date={day_iso}&end_date={day_iso}"
-        "&hourly=temperature_2m,precipitation"
-        "&temperature_unit=fahrenheit"
-        "&timezone=America/Los_Angeles"
-    )
-    try:
-        with urllib.request.urlopen(url, timeout=5) as r:
-            data = json.load(r)
-        hours = [datetime.fromisoformat(t).hour for t in data["hourly"]["time"]]
-        temps = data["hourly"]["temperature_2m"]
-        precip = data["hourly"]["precipitation"]
-        return {h: (float(t), 1 if (p or 0) > 0.1 else 0) for h, t, p in zip(hours, temps, precip)}
-    except Exception:
-        return None
-
-
-def weather_for(ts: datetime) -> tuple[float, int]:
-    day_data = _weather_day(ts.date().isoformat())
-    if day_data and ts.hour in day_data:
-        return day_data[ts.hour]
-    return 60.0, 0
-
-
-# ── Geo helpers ──────────────────────────────────────────────────────────────
-def haversine_vec(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
-    """Vectorized haversine distance in meters, scalar origin → array dest."""
-    R = 6_371_000
-    lat1r = math.radians(lat1)
-    lat2r = np.radians(lat2)
-    dlat = np.radians(lat2 - lat1)
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat / 2) ** 2 + math.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2
-    return 2 * R * np.arcsin(np.sqrt(a))
-
-
-# ── Feature engineering ──────────────────────────────────────────────────────
-def is_school_day(d: date) -> int:
-    """Rough SF school-year heuristic: weekdays, Sep–May, not a US holiday."""
-    if d.weekday() >= 5 or d in US_HOLIDAYS:
-        return 0
-    if d.month in (6, 7, 8):
-        return 0
-    return 1
-
-
-def event_intensity_at(lat: float, lon: float, ts: datetime, radius_m: float = 800.0) -> float:
-    """max(exp(-dist_m / 300)) over active events within `radius_m`. Matches
-    the encoding used during training (see dev/preprocess_real_data.ipynb)."""
-    if events is None or events.empty:
-        return 0.0
-    same_day = events[events["date"].dt.date == ts.date()]
-    if same_day.empty:
-        return 0.0
-    in_window = same_day[(same_day["start_hour"] <= ts.hour) & (ts.hour <= same_day["end_hour"])]
-    if in_window.empty:
-        return 0.0
-    dists = haversine_vec(lat, lon, in_window["venue_lat"].values, in_window["venue_lon"].values)
-    close = dists <= radius_m
-    if not close.any():
-        return 0.0
-    return float(np.exp(-dists[close] / 300.0).max())
-
-
-def lag_value(lat: float, lon: float, ts: datetime, days: int) -> float:
-    target = ts - timedelta(days=days)
-    mask = (lag_hist["lat"] == lat) & (lag_hist["lon"] == lon) & (lag_hist["timestamp"] == target)
-    hit = lag_hist.loc[mask, "occupancy_pct"]
-    return float(hit.iloc[0]) if len(hit) else np.nan
-
-
-def lag_mean_value(lat: float, lon: float, ts: datetime, days: int) -> float:
-    """Mean `occupancy_pct` at (lat, lon) over the past `days` days across all
-    hours. Calendar-rolling window [ts - days, ts). Returns NaN if no rows."""
-    if lag_hist is None:
-        return np.nan
-    start = ts - timedelta(days=days)
-    mask = (
-        (lag_hist["lat"] == lat)
-        & (lag_hist["lon"] == lon)
-        & (lag_hist["timestamp"] >= start)
-        & (lag_hist["timestamp"] < ts)
-    )
-    hits = lag_hist.loc[mask, "occupancy_pct"]
-    return float(hits.mean()) if len(hits) else np.nan
-
-
-def block_aggregates_for(lat: float, lon: float, hour: int, dow: int) -> tuple[float, float, float]:
-    """(block_mean, block_hour_mean, block_hour_dow_mean) with progressive
-    fallbacks. block_hour_dow_mean is the additive baseline the residual
-    LightGBM was trained against."""
-    exact = block_aggs[
-        (block_aggs["lat"] == lat)
-        & (block_aggs["lon"] == lon)
-        & (block_aggs["hour"] == hour)
-        & (block_aggs["day_of_week"] == dow)
-    ]
-    if len(exact):
-        r = exact.iloc[0]
-        return (
-            float(r["block_mean"]),
-            float(r["block_hour_mean"]),
-            float(r["block_hour_dow_mean"]),
-        )
-
-    hour_only = block_aggs[
-        (block_aggs["lat"] == lat) & (block_aggs["lon"] == lon) & (block_aggs["hour"] == hour)
-    ]
-    if len(hour_only):
-        bhm = float(hour_only["block_hour_mean"].iloc[0])
-        bm = float(hour_only["block_mean"].iloc[0])
-        return bm, bhm, bhm
-
-    block_only = block_aggs[(block_aggs["lat"] == lat) & (block_aggs["lon"] == lon)]
-    if len(block_only):
-        bm = float(block_only["block_mean"].iloc[0])
-        return bm, bm, bm
-
-    gm = global_baseline_mean
-    return gm, gm, gm
-
-
-def citations_median(hour: int, dow: int) -> float:
-    row = cit_lookup[(cit_lookup["hour"] == hour) & (cit_lookup["day_of_week"] == dow)]
-    return float(row["citations_hourly_median"].iloc[0]) if len(row) else 0.0
-
-
-_POI_COLS = (
-    "poi_dining_200m",
-    "poi_retail_200m",
-    "poi_transit_200m",
-    "poi_attraction_200m",
-)
-_PERMIT_COLS = ("permit_active", "permit_count_30d")
-
-
-def block_static_for(lat: float, lon: float) -> dict:
-    """Per-block static POI counts + most-recent permit snapshot.
-
-    POIs are genuinely static across the training window. Permit columns are
-    time-varying in reality, but `build_block_lookups.py` snapshots the last
-    observed value per block as a stopgap until the serving layer gets a live
-    permits feed; predictions for long-in-the-future timestamps will be as
-    stale as that snapshot.
-    """
-    if block_static is None:
-        return {c: np.nan for c in (*_POI_COLS, *_PERMIT_COLS)}
-    row = block_static[(block_static["lat"] == lat) & (block_static["lon"] == lon)]
-    if row.empty:
-        return {c: np.nan for c in (*_POI_COLS, *_PERMIT_COLS)}
-    r = row.iloc[0]
-    return {c: float(r[c]) for c in (*_POI_COLS, *_PERMIT_COLS)}
-
-
-def complaints_for(lat: float, lon: float, hour: int, dow: int) -> tuple[float, float]:
-    """(complaints_311_median, complaints_311_total) for this block / hour / dow."""
-    if complaints_lookup is None:
-        return np.nan, np.nan
-    row = complaints_lookup[
-        (complaints_lookup["lat"] == lat)
-        & (complaints_lookup["lon"] == lon)
-        & (complaints_lookup["hour"] == hour)
-        & (complaints_lookup["day_of_week"] == dow)
-    ]
-    if row.empty:
-        return np.nan, np.nan
-    r = row.iloc[0]
-    return float(r["complaints_311_median"]), float(r["complaints_311_total"])
-
-
-def sfpark_for(lat: float, lon: float, hour: int, is_weekend: int) -> float:
-    """SFpark calibration occupancy for this block at this hour / weekendness."""
-    if sfpark_lookup is None:
-        return np.nan
-    row = sfpark_lookup[
-        (sfpark_lookup["lat"] == lat)
-        & (sfpark_lookup["lon"] == lon)
-        & (sfpark_lookup["hour"] == hour)
-        & (sfpark_lookup["is_weekend"] == is_weekend)
-    ]
-    if row.empty:
-        return np.nan
-    return float(row["sfpark_block_occ"].iloc[0])
-
-
-def build_feature_row(block_row: pd.Series, ts: datetime, temp_f: float, raining: int) -> dict:
-    lat = float(block_row["lat"])
-    lon = float(block_row["lon"])
-    hour = ts.hour
-    dow = ts.weekday()
-    is_weekend = 1 if dow >= 5 else 0
-    bm, bhm, baseline = block_aggregates_for(lat, lon, hour, dow)
-
-    statics = block_static_for(lat, lon)
-    comp_med, comp_tot = complaints_for(lat, lon, hour, dow)
-    sfpark_occ = sfpark_for(lat, lon, hour, is_weekend)
-
-    return {
-        "hour": hour,
-        "day_of_week": dow,
-        "month": ts.month,
-        "is_weekend": is_weekend,
-        "is_holiday": 1 if ts.date() in US_HOLIDAYS else 0,
-        "is_school_day": is_school_day(ts.date()),
-        "is_raining": raining,
-        "temperature": temp_f,
-        "event_intensity": event_intensity_at(lat, lon, ts),
-        "citation_count": 0.0,
-        "citations_hourly_median": citations_median(hour, dow),
-        "complaints_311_median": comp_med,
-        "complaints_311_total": comp_tot,
-        "poi_dining_200m": statics["poi_dining_200m"],
-        "poi_retail_200m": statics["poi_retail_200m"],
-        "poi_transit_200m": statics["poi_transit_200m"],
-        "poi_attraction_200m": statics["poi_attraction_200m"],
-        "sfpark_block_occ": sfpark_occ,
-        "permit_active": statics["permit_active"],
-        "permit_count_30d": statics["permit_count_30d"],
-        "lat": lat,
-        "lon": lon,
-        "total_spaces": int(block_row["total_spaces"]),
-        "block_mean": bm,
-        "block_hour_mean": bhm,
-        "lag_1d": lag_value(lat, lon, ts, 1),
-        "lag_2d": lag_value(lat, lon, ts, 2),
-        "lag_7d": lag_value(lat, lon, ts, 7),
-        "lag_14d": lag_value(lat, lon, ts, 14),
-        "lag_28d": lag_value(lat, lon, ts, 28),
-        "lag_3d_mean": lag_mean_value(lat, lon, ts, 3),
-        "lag_7d_mean": lag_mean_value(lat, lon, ts, 7),
-        "neighborhood": str(block_row["neighborhood"]),
-        "_baseline": baseline,
-    }
-
-
-def score_blocks(block_df: pd.DataFrame, ts: datetime) -> pd.DataFrame:
-    """Run the residual LightGBM and add occupancy + available-spaces columns.
-    Residual is added to block_hour_dow_mean baseline (see train_lightgbm)."""
-    temp_f, raining = weather_for(ts)
-    rows = [build_feature_row(r, ts, temp_f, raining) for _, r in block_df.iterrows()]
-    feat = pd.DataFrame(rows)
-    baselines = feat.pop("_baseline").values
-    feat["neighborhood"] = feat["neighborhood"].astype("category")
-    for col in FEATURES_NUMERIC:
-        feat[col] = pd.to_numeric(feat[col], errors="coerce")
-
-    residual = model.predict(feat[FEATURES])
-    occupancy = np.clip(baselines + residual, 0, 100)
-
-    out = block_df.copy().reset_index(drop=True)
-    out["predicted_occupancy_pct"] = occupancy.round(2)
-    out["available_spaces"] = (out["total_spaces"] * (1 - occupancy / 100)).round().astype(int)
-    return out
-
-
-# ── Response classification ──────────────────────────────────────────────────
-def demand_level(pct: float) -> str:
-    if pct < 40:
-        return "Low"
-    if pct < 70:
-        return "Medium"
-    if pct < 85:
-        return "High"
-    return "Very High"
-
-
-def color_for(pct: float) -> str:
-    """Hex color used by the frontend map markers. Matches the UI legend."""
-    if pct < 40:
-        return "#22c55e"  # green  — Easy
-    if pct < 70:
-        return "#f59e0b"  # amber  — Moderate
-    if pct < 85:
-        return "#f97316"  # orange — Hard
-    return "#ef4444"  # red    — Very Hard
-
-
-def street_label_for(lat: float, lon: float, neighborhood: str) -> str:
-    """Prefer a human-readable street name from master_blocks if available,
-    otherwise fall back to a neighborhood-tagged label."""
-    if master is not None and not master.empty:
-        candidate_cols = [c for c in ("corridor", "limits") if c in master.columns]
-        if candidate_cols:
-            # Nearest master block within ~80m (street-segment centers can
-            # drift from metered centroids).
-            dists = haversine_vec(lat, lon, master["lat"].values, master["lon"].values)
-            nearest = int(np.argmin(dists))
-            if dists[nearest] <= 80.0:
-                for col in candidate_cols:
-                    val = master.iloc[nearest][col]
-                    if pd.notna(val) and str(val).strip():
-                        return str(val).strip()
-    pretty_nbh = neighborhood.replace("_", " ").title() if neighborhood else "Unknown"
-    return f"{pretty_nbh} block"
-
-
-# ── Request / response schemas ───────────────────────────────────────────────
-class BlockPredictionRequest(BaseModel):
-    """Matches the POST body sent by parkcast-frontend/app/page.js.
-
-    Most "condition" fields (is_holiday, is_school_day, is_raining, temperature,
-    has_nearby_event) are resolved server-side from the arrival timestamp and
-    Open-Meteo + the events catalog, so the client-supplied values are accepted
-    for backwards compatibility but deliberately ignored — the server's answer
-    stays self-consistent even if the browser's weather fetch failed."""
-
+# ── Pydantic models ────────────────────────────────────────────────
+class BlocksRequest(BaseModel):
     lat: float = Field(..., description="Destination latitude")
     lon: float = Field(..., description="Destination longitude")
-    radius_meters: int = Field(1500, ge=100, le=3000)
+    radius_meters: int = Field(500, ge=100, le=2000)
     hour: int = Field(..., ge=0, le=23)
     day_of_week: int = Field(..., ge=0, le=6)
     month: int = Field(..., ge=1, le=12)
     is_raining: int = Field(0, ge=0, le=1)
-    has_nearby_event: int = Field(0, ge=0, le=1)
     is_holiday: int = Field(0, ge=0, le=1)
     is_school_day: int = Field(1, ge=0, le=1)
     temperature: float = Field(60.0)
-    minutes_away: int = Field(0, ge=0, le=180)
+    event_intensity: float = Field(0.0, ge=0.0, le=1.0)
+    minutes_away: int = Field(0, ge=0, le=120)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "lat": 37.7816,
+                "lon": -122.3975,
+                "radius_meters": 500,
+                "hour": 19,
+                "day_of_week": 4,
+                "month": 4,
+                "is_raining": 0,
+                "is_holiday": 0,
+                "is_school_day": 1,
+                "temperature": 62.5,
+                "event_intensity": 0.6,
+                "minutes_away": 20,
+            }
+        }
 
 
 class BlockPrediction(BaseModel):
-    block_id: str
-    street: str
     lat: float
     lon: float
+    street: Optional[str] = None
+    neighborhood: Optional[str] = None
     total_spaces: int
-    neighborhood: str
     distance_meters: int
     predicted_occupancy_pct: float
     available_spaces_estimate: int
     demand_level: str
     color: str
+    # "metered"  — block has SFpark training labels, prediction is direct
+    # "inferred" — non-metered blockface, prediction via neighborhood baseline
+    coverage: str = "metered"
 
 
-class BlockPredictionResponse(BaseModel):
+class BlocksResponse(BaseModel):
     destination_lat: float
     destination_lon: float
     radius_meters: int
@@ -612,105 +257,308 @@ class BlockPredictionResponse(BaseModel):
     blocks: List[BlockPrediction]
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+class ParkingInput(BaseModel):
+    """Aggregate neighborhood-level prediction (backward-compat with v2)."""
+
+    hour: int = Field(..., ge=0, le=23)
+    day_of_week: int = Field(..., ge=0, le=6)
+    month: int = Field(..., ge=1, le=12)
+    neighborhood: str = Field(...)
+    total_spaces: int = Field(40, ge=1)
+    is_raining: int = Field(0, ge=0, le=1)
+    is_holiday: int = Field(0, ge=0, le=1)
+    is_school_day: int = Field(1, ge=0, le=1)
+    temperature: float = Field(60.0)
+    event_intensity: float = Field(0.0, ge=0.0, le=1.0)
+
+
+class ParkingPrediction(BaseModel):
+    neighborhood: str
+    hour: int
+    day_of_week: int
+    predicted_occupancy_pct: float
+    available_spaces_estimate: int
+    demand_level: str
+    recommendation: str
+    blocks_aggregated: int
+
+    class Config:
+        protected_namespaces = ()
+
+
+# ── Helpers ────────────────────────────────────────────────────────
+def _haversine_vec(lat0: float, lon0: float, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    R = 6_371_000
+    phi0 = math.radians(lat0)
+    phi1 = np.radians(lats)
+    dphi = np.radians(lats - lat0)
+    dlam = np.radians(lons - lon0)
+    a = np.sin(dphi / 2) ** 2 + math.cos(phi0) * np.cos(phi1) * np.sin(dlam / 2) ** 2
+    return R * 2 * np.arcsin(np.sqrt(a))
+
+
+def _demand_level(pct: float) -> str:
+    if pct < 40:
+        return "Low"
+    if pct < 70:
+        return "Medium"
+    if pct < 85:
+        return "High"
+    return "Very High"
+
+
+def _color(pct: float) -> str:
+    if pct < 40:
+        return "#22c55e"  # green
+    if pct < 70:
+        return "#f59e0b"  # amber
+    if pct < 85:
+        return "#f97316"  # orange
+    return "#ef4444"  # red
+
+
+def _recommendation(pct: float) -> str:
+    if pct < 40:
+        return "Easy to park — plenty of spaces."
+    if pct < 70:
+        return "Good chance of parking — head over."
+    if pct < 85:
+        return "Limited spots — arrive early or check nearby blocks."
+    return "Very hard to park — consider transit or a garage."
+
+
+LAG_COLS = ["lag_1d", "lag_2d", "lag_7d", "lag_14d", "lag_28d", "lag_3d_mean", "lag_7d_mean"]
+
+
+def _build_features(
+    blocks_df: pd.DataFrame,
+    target_hour: int,
+    req: BlocksRequest,
+    bundle: ModelBundle,
+) -> pd.DataFrame:
+    """Attach every feature LightGBM needs to each block row.
+
+    Returns a DataFrame with all `bundle.features` columns plus a `_baseline`
+    column (block_hour_dow_mean with fallbacks) used to reconstruct the
+    non-residual prediction.
+    """
+    df = blocks_df.copy()
+
+    df["hour"] = target_hour
+    df["day_of_week"] = req.day_of_week
+    df["month"] = req.month
+    df["is_weekend"] = 1 if req.day_of_week >= 5 else 0
+    df["is_holiday"] = req.is_holiday
+    df["is_school_day"] = req.is_school_day
+    df["is_raining"] = req.is_raining
+    df["temperature"] = req.temperature
+    df["event_intensity"] = req.event_intensity
+
+    df = df.merge(bundle.block_aggs, on=["lat", "lon", "hour", "day_of_week"], how="left")
+    df = df.merge(bundle.static, on=["lat", "lon"], how="left")
+    df = df.merge(bundle.cit_med, on=["hour", "day_of_week"], how="left")
+
+    # Inferred (non-metered) blocks miss the per-(lat, lon) join above. Fill
+    # the resulting NaNs with this block's KNN-derived per-(cnn, hour, dow)
+    # baseline (distance-weighted average of the K=5 nearest metered blocks)
+    # before the global-mean fallback. cnn is populated only on inferred rows
+    # so this is effectively a left-join scoped to that subset.
+    if bundle.inferred_aggs is not None and "cnn" in df.columns:
+        infa = bundle.inferred_aggs.rename(
+            columns={
+                "block_hour_dow_mean": "_inf_bhd",
+                "block_hour_mean": "_inf_bh",
+                "block_mean": "_inf_bm",
+            }
+        )
+        df = df.merge(infa, on=["cnn", "hour", "day_of_week"], how="left")
+        df["block_hour_dow_mean"] = df["block_hour_dow_mean"].fillna(df["_inf_bhd"])
+        df["block_hour_mean"] = df["block_hour_mean"].fillna(df["_inf_bh"])
+        df["block_mean"] = df["block_mean"].fillna(df["_inf_bm"])
+        df = df.drop(columns=["_inf_bhd", "_inf_bh", "_inf_bm"])
+
+    # Lags stay NaN: lag_history ends at the training split and no live feed
+    # is wired yet. LightGBM uses surrogate splits for missing features.
+    for col in LAG_COLS:
+        df[col] = np.nan
+
+    df["neighborhood"] = df["neighborhood"].astype(bundle.neighborhood_dtype)
+
+    df["_baseline"] = (
+        df["block_hour_dow_mean"].fillna(df["block_hour_mean"]).fillna(df["block_mean"]).fillna(bundle.global_mean)
+    )
+    return df
+
+
+def _predict_rows(df: pd.DataFrame, bundle: ModelBundle) -> np.ndarray:
+    X = df[bundle.features]
+    residual = bundle.model.predict(X)
+    return np.clip(df["_baseline"].values + residual, 0.0, 100.0)
+
+
+# ── Endpoints ──────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to ParkCast SF API v2",
-        "description": "Block-by-block parking prediction for San Francisco",
-        "version": "2.0.0",
-        "endpoints": {
-            "health": "GET /health",
-            "predict_blocks": "POST /predict/blocks",
-            "docs": "GET /docs",
-        },
+        "name": "ParkCast SF API",
+        "version": "3.0.0",
+        "endpoints": [
+            "GET /health",
+            "POST /predict",
+            "POST /predict/blocks",
+            "GET /geocode_proxy",
+            "GET /docs",
+        ],
     }
 
 
 @app.get("/health")
 def health():
-    if model is None or blocks is None:
-        raise HTTPException(status_code=503, detail="Model not loaded.")
+    if BUNDLE is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    metrics = BUNDLE.meta.get("metrics", {})
     return {
         "status": "healthy",
-        "model_loaded": True,
-        "model_type": type(model).__name__,
-        "model_source": model_source,
-        "num_features": len(FEATURES),
-        "total_blocks_in_db": int(len(blocks)),
-        "trained_test_mae": meta.get("metrics", {}).get("residual_model", {}).get("mae"),
+        "artifact_source": BUNDLE.src,
+        "model_features": len(BUNDLE.features),
+        "total_blocks": int(len(BUNDLE.blocks)),
+        "train_split_time": BUNDLE.meta.get("split_time"),
+        "test_mae": metrics.get("residual_model", {}).get("mae"),
+        "test_r2": metrics.get("residual_model", {}).get("r2"),
+        "mlflow_run_id": BUNDLE.meta.get("mlflow_run_id"),
     }
 
 
-@app.post("/predict/blocks", response_model=BlockPredictionResponse)
-def predict_blocks_endpoint(req: BlockPredictionRequest):
-    """Rank every metered block within `radius_meters` of (lat, lon) by
-    predicted occupancy at arrival time. If no blocks fall inside the radius,
-    return the 8 closest so the map still has something to render."""
-    if model is None or blocks is None:
-        raise HTTPException(status_code=503, detail="Model not loaded.")
+@app.post("/predict/blocks", response_model=BlocksResponse)
+def predict_blocks(req: BlocksRequest):
+    if BUNDLE is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
 
-    arrival_ts = datetime.now() + timedelta(minutes=req.minutes_away)
-    arrival_hour = arrival_ts.hour
+    target_hour = (req.hour + req.minutes_away // 60) % 24
 
-    dists = haversine_vec(req.lat, req.lon, blocks["lat"].values, blocks["lon"].values)
-    mask = dists <= req.radius_meters
+    blocks = BUNDLE.blocks.copy()
+    blocks["distance_m"] = _haversine_vec(req.lat, req.lon, blocks["lat"].to_numpy(), blocks["lon"].to_numpy())
 
-    if mask.any():
-        near = blocks.loc[mask].copy()
-        near_dists = dists[mask]
-    else:
-        nearest_idx = np.argsort(dists)[:8]
-        near = blocks.iloc[nearest_idx].copy()
-        near_dists = dists[nearest_idx]
+    nearby = blocks[blocks["distance_m"] <= req.radius_meters].sort_values("distance_m")
+    if nearby.empty:
+        # Nothing in radius → snap to the 8 closest trained blocks so the user
+        # still gets a usable answer.
+        nearby = blocks.sort_values("distance_m").head(8)
 
-    if near.empty:
-        return BlockPredictionResponse(
-            destination_lat=req.lat,
-            destination_lon=req.lon,
-            radius_meters=req.radius_meters,
-            predicted_at_hour=arrival_hour,
-            minutes_away=req.minutes_away,
-            total_blocks_found=0,
-            blocks=[],
-        )
+    # Cap the result list — the citywide universe makes it possible to match
+    # thousands of blocks within a 2km radius downtown.
+    nearby = nearby.head(MAX_BLOCKS_RETURNED)
 
-    near = near.reset_index(drop=True)
-    near["distance_m"] = near_dists
-
-    scored = score_blocks(near.drop(columns=["distance_m"]), arrival_ts)
-    scored["distance_m"] = near["distance_m"].values
+    feat_df = _build_features(nearby, target_hour, req, BUNDLE)
+    preds = _predict_rows(feat_df, BUNDLE)
 
     out: List[BlockPrediction] = []
-    for _, r in scored.iterrows():
-        lat = float(r["lat"])
-        lon = float(r["lon"])
-        occ = float(r["predicted_occupancy_pct"])
-        nbh = str(r["neighborhood"])
+    for (_, row), pct in zip(feat_df.iterrows(), preds):
+        pct = float(round(pct, 2))
+        total = int(row["total_spaces"]) if pd.notna(row["total_spaces"]) else 0
+        avail = int(total * (1 - pct / 100))
+        neigh = row["neighborhood"]
         out.append(
             BlockPrediction(
-                block_id=f"b_{lat:.5f}_{lon:.5f}",
-                street=street_label_for(lat, lon, nbh),
-                lat=lat,
-                lon=lon,
-                total_spaces=int(r["total_spaces"]),
-                neighborhood=nbh,
-                distance_meters=int(round(float(r["distance_m"]))),
-                predicted_occupancy_pct=round(occ, 2),
-                available_spaces_estimate=int(r["available_spaces"]),
-                demand_level=demand_level(occ),
-                color=color_for(occ),
+                lat=float(row["lat"]),
+                lon=float(row["lon"]),
+                street=str(row["street"]) if "street" in row and pd.notna(row.get("street")) else None,
+                neighborhood=str(neigh) if pd.notna(neigh) else None,
+                total_spaces=total,
+                distance_meters=int(row["distance_m"]),
+                predicted_occupancy_pct=pct,
+                available_spaces_estimate=avail,
+                demand_level=_demand_level(pct),
+                color=_color(pct),
+                coverage=str(row["coverage"]) if "coverage" in row and pd.notna(row.get("coverage")) else "metered",
             )
         )
 
-    out.sort(key=lambda b: b.distance_meters)
-
-    return BlockPredictionResponse(
+    return BlocksResponse(
         destination_lat=req.lat,
         destination_lon=req.lon,
         radius_meters=req.radius_meters,
-        predicted_at_hour=arrival_hour,
+        predicted_at_hour=target_hour,
         minutes_away=req.minutes_away,
         total_blocks_found=len(out),
         blocks=out,
     )
+
+
+@app.post("/predict", response_model=ParkingPrediction)
+def predict(body: ParkingInput):
+    """Aggregate prediction across every trained block in a neighborhood."""
+    if BUNDLE is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    mask = BUNDLE.blocks["neighborhood"].str.lower() == body.neighborhood.strip().lower()
+    neigh_blocks = BUNDLE.blocks[mask].copy()
+    if neigh_blocks.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No trained blocks found in neighborhood '{body.neighborhood}'.",
+        )
+
+    synthetic_req = BlocksRequest(
+        lat=float(neigh_blocks["lat"].mean()),
+        lon=float(neigh_blocks["lon"].mean()),
+        radius_meters=2000,
+        hour=body.hour,
+        day_of_week=body.day_of_week,
+        month=body.month,
+        is_raining=body.is_raining,
+        is_holiday=body.is_holiday,
+        is_school_day=body.is_school_day,
+        temperature=body.temperature,
+        event_intensity=body.event_intensity,
+        minutes_away=0,
+    )
+    neigh_blocks["distance_m"] = 0.0
+    feat_df = _build_features(neigh_blocks, body.hour, synthetic_req, BUNDLE)
+    preds = _predict_rows(feat_df, BUNDLE)
+    pct = float(round(float(np.median(preds)), 2))
+    avail = int(body.total_spaces * (1 - pct / 100))
+
+    return ParkingPrediction(
+        neighborhood=body.neighborhood,
+        hour=body.hour,
+        day_of_week=body.day_of_week,
+        predicted_occupancy_pct=pct,
+        available_spaces_estimate=avail,
+        demand_level=_demand_level(pct),
+        recommendation=_recommendation(pct),
+        blocks_aggregated=int(len(neigh_blocks)),
+    )
+
+
+@app.get("/geocode_proxy")
+def geocode_proxy(q: str):
+    import requests
+
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": f"{q} San Francisco CA",
+                "format": "json",
+                "limit": 6,
+                "addressdetails": 1,
+            },
+            headers={
+                "User-Agent": "ParkCastSF/3.0 (university project usfca.edu)",
+                "Accept-Language": "en",
+                "Referer": "https://parkcast-frontend.vercel.app",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        filtered = [
+            d
+            for d in data
+            if "san francisco" in d.get("display_name", "").lower() or "california" in d.get("display_name", "").lower()
+        ]
+        return filtered or data
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Geocode error: {e}")
+        return []

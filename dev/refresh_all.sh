@@ -26,48 +26,101 @@ echo "  Project: $PROJECT_DIR"
 echo "  GCS:     $GCS_TARGET"
 echo "=========================================="
 
+log "0/12 Fetching every dataset fresh from DataSF (single source of truth)"
+# No bootstrap fallback: if a SODA fetch fails, the pipeline halts. We'd
+# rather skip a refresh cycle than ship stale or partial data downstream.
+SODA_BASE="https://data.sfgov.org/resource"
+mkdir -p "$PROJECT_DIR/data"
+fetch() {
+  # fetch <filename> <socrata-id> <limit>
+  local out="$PROJECT_DIR/data/$1"
+  local id="$2"
+  local limit="${3:-100000}"
+  local ext="${1##*.}"
+  local url="$SODA_BASE/$id.$ext?\$limit=$limit"
+  echo "  $1 ($id, limit=$limit)"
+  if ! curl -fsSL --max-time 1200 -o "$out.tmp" "$url"; then
+    rm -f "$out.tmp"
+    echo "ERROR: SODA fetch failed for $1 ($url)" >&2
+    exit 1
+  fi
+  if [ ! -s "$out.tmp" ]; then
+    rm -f "$out.tmp"
+    echo "ERROR: SODA returned empty body for $1" >&2
+    exit 1
+  fi
+  mv "$out.tmp" "$out"
+}
+fetch parking_census.json       9ivs-nf5y    50000
+fetch street_sweeping.csv       yhqp-riqs    50000
+fetch parking_regulations.csv   hi6h-neyh    50000
+fetch rpp_parcels.json          i886-hxz9   100000
+fetch sf_centerlines.json       3psu-pn9h    50000
+fetch meter_locations.csv       8vzz-qzz9   100000
+fetch parking_citations.csv     ab4h-6ztd  3000000
+
 cd "$PROJECT_DIR/dev"
 
-log "1/8 Fetching SFMTA meter transactions (download_12mo_transactions.ipynb)"
+log "1/12 Fetching SFMTA meter transactions (download_12mo_transactions.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace download_12mo_transactions.ipynb \
   --ExecutePreprocessor.timeout=3600
 
-log "2/8 Fetching 311 parking complaints (fetch_311.ipynb)"
+log "2/12 Fetching 311 parking complaints (fetch_311.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace fetch_311.ipynb \
   --ExecutePreprocessor.timeout=1200
 
-log "3/8 Fetching events calendar (fetch_events_ics.ipynb)"
+log "3/12 Fetching events calendar (fetch_events_ics.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace fetch_events_ics.ipynb \
   --ExecutePreprocessor.timeout=600
 
-log "4/8 Rebuilding training CSV (preprocess_real_data.ipynb)"
+log "4/12 Rebuilding master_blocks (build_master_blocks.ipynb)"
+# Static-data drives this — must rerun whenever the SODA fetches above
+# updated the underlying files.
+jupyter nbconvert --to notebook --execute --inplace build_master_blocks.ipynb \
+  --ExecutePreprocessor.timeout=900
+
+log "5/12 Rebuilding training CSV (preprocess_real_data.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace preprocess_real_data.ipynb \
   --ExecutePreprocessor.timeout=3600
 
-log "5/8 Rebuilding inference parquets (build_inference_assets.ipynb)"
+log "6/12 Rebuilding metered inference parquets (build_inference_assets.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace build_inference_assets.ipynb \
   --ExecutePreprocessor.timeout=600
 
-log "6/8 Rebuilding block_static_features.parquet (build_inference_parquets.ipynb)"
+log "7/12 Rebuilding block_static_features.parquet (build_inference_parquets.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace build_inference_parquets.ipynb \
   --ExecutePreprocessor.timeout=600
 
-log "7/8 Retraining LightGBM (train_lightgbm.ipynb)"
+# build_full_blocks.ipynb reads the metered catalog from a .bak so it knows
+# which blocks were metered before it overwrites blocks.parquet with the
+# citywide version.
+cp "$PROJECT_DIR/app/models/blocks.parquet" "$PROJECT_DIR/app/models/blocks.parquet.bak"
+
+log "8/12 Building citywide blocks + KNN inferred_block_aggs (build_full_blocks.ipynb)"
+jupyter nbconvert --to notebook --execute --inplace build_full_blocks.ipynb \
+  --ExecutePreprocessor.timeout=600
+
+log "9/12 Retraining LightGBM (train_lightgbm.ipynb)"
 jupyter nbconvert --to notebook --execute --inplace train_lightgbm.ipynb \
-  --ExecutePreprocessor.timeout=5400
+  --ExecutePreprocessor.timeout=14400
 
 cd "$PROJECT_DIR"
 
-log "8/8 Uploading artifacts"
+log "10/12 Validating artifacts"
+python3 dev/validate_artifacts.py
+
+log "11/12 Uploading artifacts"
 
 # Always upload data/feature files — they're lookups, not a trained model.
-echo "  [data] lag_history.parquet, blocks.parquet, citations_hourly_median.parquet, block_static_features.parquet, sfpark_calibration.parquet"
+echo "  [data] lag_history.parquet, blocks.parquet, citations_hourly_median.parquet,"
+echo "         block_static_features.parquet, sfpark_calibration.parquet, inferred_block_aggs.parquet"
 gsutil -m cp \
   app/models/lag_history.parquet \
   app/models/blocks.parquet \
   app/models/citations_hourly_median.parquet \
   app/models/block_static_features.parquet \
   app/models/sfpark_calibration.parquet \
+  app/models/inferred_block_aggs.parquet \
   "$GCS_TARGET"
 
 # Guard the model upload — only overwrite if the new run is at least as
@@ -106,6 +159,12 @@ challenger = float('$CHALLENGER_MAE')
 print('1' if challenger <= incumbent + 1e-4 else '0')
 ")
 
+CHALLENGER_RUN_ID=$(python3 -c "
+import json
+d = json.load(open('app/models/LightGBM.meta.json'))
+print(d.get('mlflow_run_id', ''))
+")
+
 if [ "$SHOULD_UPLOAD" = "1" ]; then
   echo "  ✓ model improved (or matched) — uploading .pkl, .meta.json, .block_aggs.parquet"
   gsutil -m cp \
@@ -113,12 +172,25 @@ if [ "$SHOULD_UPLOAD" = "1" ]; then
     app/models/LightGBM.meta.json \
     app/models/LightGBM.block_aggs.parquet \
     "$GCS_TARGET"
+  echo "  MLflow run $CHALLENGER_RUN_ID stays (challenger wins)"
 else
   echo "  ⚠ model REGRESSED (challenger > incumbent) — keeping existing GCS model"
   echo "    Data files were still refreshed, so lags and static features are current."
+  if [ -n "$CHALLENGER_RUN_ID" ]; then
+    echo "  Deleting losing MLflow run $CHALLENGER_RUN_ID so the registry stays clean..."
+    python3 -c "
+import os, mlflow, sys
+mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
+try:
+    mlflow.delete_run('$CHALLENGER_RUN_ID')
+    print('    deleted')
+except Exception as e:
+    print(f'    failed (non-fatal): {e}', file=sys.stderr)
+" || true
+  fi
 fi
 
-log "Forcing Cloud Run cold-start so new files get re-downloaded"
+log "12/12 Forcing Cloud Run cold-start so new files get re-downloaded"
 gcloud run services update parkcast-api \
   --region=us-central1 \
   --update-env-vars="REFRESH_TS=$(date +%s)" \

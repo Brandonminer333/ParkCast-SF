@@ -1,15 +1,45 @@
-name: Nightly refresh
+name: ML pipeline (every 3 days)
+
+# Fully automated nightly ML pipeline:
+#   1. Bootstrap static reference data from GCS
+#   2. Ingest fresh DataSF inputs (transactions, 311, events)
+#   3. Rebuild features (training CSV, inference parquets, citywide blocks,
+#      KNN inferred_block_aggs)
+#   4. Retrain LightGBM (model is only uploaded if MAE doesn't regress)
+#   5. Validate artifacts before upload
+#   6. Upload to GCS, force Cloud Run cold-start so the deployed API
+#      re-downloads the new artifacts on the next request
+#   7. Smoke-test the prod URL
+#
+# Container code (app/main.py, Dockerfile) is NOT part of this pipeline —
+# those deploys stay manual via dev/deploy_cloudrun.sh.
 
 on:
   schedule:
-    # 09:00 UTC = 02:00 PT. DataSF transactions are usually posted by ~midnight PT.
-    - cron: "0 9 * * *"
-  workflow_dispatch:  # allow manual runs from the Actions tab
+    # Every 3 days at 09:00 UTC (= 02:00 PT). The pipeline pulls *every*
+    # dataset fresh from DataSF (not just transactions/311/events) and
+    # rebuilds master_blocks too, so daily was overkill. Lag features carry
+    # the per-day pattern; 0-72h freshness on raw inputs is plenty.
+    - cron: "0 9 */3 * *"
+  workflow_dispatch:
+
+# Don't let two pipeline runs stomp each other (cron + manual collision).
+concurrency:
+  group: parkcast-ml-pipeline
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: parkcast
+  CLOUD_RUN_SERVICE: parkcast-api
+  CLOUD_RUN_REGION: us-central1
+  CLOUD_RUN_URL: https://parkcast-api-904706413856.us-central1.run.app
 
 jobs:
-  refresh:
+  pipeline:
     runs-on: ubuntu-22.04
     timeout-minutes: 240
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +52,7 @@ jobs:
       - name: Install deps
         run: |
           pip install --no-cache-dir \
-            fastapi uvicorn pydantic pandas pyarrow numpy scikit-learn \
+            fastapi uvicorn pydantic pandas pyarrow numpy scipy scikit-learn \
             lightgbm joblib requests google-cloud-storage \
             jupyter nbconvert mlflow optuna
 
@@ -33,15 +63,40 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
         with:
-          project_id: parkcast
+          project_id: ${{ env.GCP_PROJECT }}
 
-      - name: Bootstrap static data files from GCS
-        run: |
-          mkdir -p data
-          gsutil -m cp gs://parkcast-bucket/data-bootstrap/*.csv data/
-          ls -la data/
+      - name: Prepare data directory
+        run: mkdir -p data
 
-      - name: Run full refresh pipeline
+      - name: Run full refresh pipeline (ingest → features → retrain → upload)
         run: bash dev/refresh_all.sh
         env:
           MLFLOW_TRACKING_URI: http://34.134.159.106:5000
+
+      - name: Validate artifacts
+        run: python3 dev/validate_artifacts.py
+
+      - name: Force Cloud Run cold-start
+        run: |
+          gcloud run services update "${{ env.CLOUD_RUN_SERVICE }}" \
+            --region="${{ env.CLOUD_RUN_REGION }}" \
+            --update-env-vars="REFRESH_TS=$(date +%s)" \
+            --project="${{ env.GCP_PROJECT }}" \
+            >/dev/null
+          echo "  cold-start forced — new artifacts will be re-downloaded from GCS on next request"
+
+      - name: Smoke test prod
+        run: bash dev/smoke_test.sh "${{ env.CLOUD_RUN_URL }}"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## ParkCast ML pipeline — ${{ job.status }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Trigger | ${{ github.event_name }} |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Cloud Run URL | ${{ env.CLOUD_RUN_URL }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
