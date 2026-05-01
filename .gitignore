@@ -15,5 +15,4 @@ parkcast-frontend/.env.local
 
 *.csv
 
-# Keep large demo videos local (GitHub blocks >100MB without LFS)
-docs/demo-video.mov
+# (demo-video is tracked via Git LFS; do not ignore)
