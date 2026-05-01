@@ -57,9 +57,19 @@ ARTIFACT_FILES = [
     "block_static_features.parquet",
 ]
 
-# Optional: enriches blocks with corridor/limits (street name + cross-streets).
-# Missing in GCS won't break the service; the `street` field just stays None.
-OPTIONAL_ARTIFACT_FILES = ["master_blocks.parquet"]
+# Optional: enriches blocks with corridor/limits (street name + cross-streets)
+# and provides per-cnn (hour, dow) fallback baselines for inferred (non-metered)
+# blocks — distance-weighted KNN over the K=5 nearest metered blocks. Missing
+# in GCS won't break the service.
+OPTIONAL_ARTIFACT_FILES = [
+    "master_blocks.parquet",
+    "inferred_block_aggs.parquet",
+]
+
+# Cap on rows returned by /predict/blocks. The served universe is now
+# citywide (~12.7k blockfaces), so a 2km radius can match thousands; the
+# frontend map gets unusable above a few hundred markers.
+MAX_BLOCKS_RETURNED = 200
 
 
 def _download_from_gcs(bucket: str, prefix: str, files: List[str], dest: str, optional: bool = False) -> None:
@@ -112,30 +122,37 @@ class ModelBundle:
         self.static = pd.read_parquet(os.path.join(src, "block_static_features.parquet"))
         self.cit_med = pd.read_parquet(os.path.join(src, "citations_hourly_median.parquet"))
 
-        # Optional enrichment: master_blocks.parquet has human-readable
-        # street names ("corridor") and cross-streets ("limits"). Merge on
-        # (lat, lon); if the file isn't present, `street` stays NaN and the
-        # API returns null for that field.
-        master_path = os.path.join(src, "master_blocks.parquet")
-        if os.path.exists(master_path):
-            try:
-                master = pd.read_parquet(master_path)[["lat", "lon", "corridor", "limits"]].dropna(
-                    subset=["lat", "lon"]
-                )
-                # blocks.parquet and master_blocks.parquet use different lat/lon
-                # precisions and the rows don't share IDs, so an exact merge
-                # produces 0 matches. Use a KDTree nearest-neighbor join with
-                # a ~50m tolerance instead. SF span is small enough that
-                # treating degrees as a flat plane is fine for matching.
-                from scipy.spatial import cKDTree
+        # Per-cnn (hour, dow) baselines for inferred blocks — distance-weighted
+        # KNN over the K=5 nearest metered blocks (built in
+        # dev/build_full_blocks.ipynb). Each inferred block's baseline reflects
+        # the local metered behavior, not a flat neighborhood average.
+        # Optional: older bundles without this file degrade to global_mean.
+        inferred_path = os.path.join(src, "inferred_block_aggs.parquet")
+        self.inferred_aggs: Optional[pd.DataFrame] = (
+            pd.read_parquet(inferred_path) if os.path.exists(inferred_path) else None
+        )
 
-                tree = cKDTree(master[["lat", "lon"]].values)
-                dist, idx = tree.query(self.blocks[["lat", "lon"]].values, k=1)
-                near = dist < 0.0005  # ~55m at SF latitude
-                corridor = pd.Series([None] * len(self.blocks))
-                limits = pd.Series([None] * len(self.blocks))
-                corridor.loc[near] = master["corridor"].values[idx[near]]
-                limits.loc[near] = master["limits"].values[idx[near]]
+        # `coverage` was added when blocks.parquet went citywide. Older
+        # metered-only bundles don't have it; default everything to "metered"
+        # so existing clients keep working.
+        if "coverage" not in self.blocks.columns:
+            self.blocks["coverage"] = "metered"
+
+        # Street label enrichment: cnn-keyed merge against master_blocks.
+        # build_full_blocks.ipynb populates `cnn` on every block (including
+        # metered ones via spatial-join), so an exact key merge replaces the
+        # older KDTree-with-tolerance fallback that missed ~1.3% of long
+        # downtown blocks. Falls back to None if master_blocks isn't present.
+        self.blocks["street"] = None
+        master_path = os.path.join(src, "master_blocks.parquet")
+        if os.path.exists(master_path) and "cnn" in self.blocks.columns:
+            try:
+                master = pd.read_parquet(master_path)[["cnn", "corridor", "limits"]].dropna(subset=["cnn"])
+                master["cnn"] = master["cnn"].astype("Int64")
+                blocks_cnn = self.blocks["cnn"].astype("Int64")
+                lookup = master.set_index("cnn")
+                corridors = blocks_cnn.map(lookup["corridor"])
+                limits = blocks_cnn.map(lookup["limits"])
 
                 def _street(c, l):
                     if pd.notna(c) and pd.notna(l):
@@ -144,13 +161,11 @@ class ModelBundle:
                         return str(c)
                     return None
 
-                self.blocks["street"] = [_street(c, l) for c, l in zip(corridor, limits)]
-                logger.info(f"  street enrichment matched {near.sum():,}/{len(self.blocks):,} blocks")
+                self.blocks["street"] = [_street(c, l) for c, l in zip(corridors, limits)]
+                matched = self.blocks["street"].notna().sum()
+                logger.info(f"  street enrichment matched {matched:,}/{len(self.blocks):,} blocks (cnn join)")
             except Exception as e:
                 logger.warning(f"master_blocks.parquet unreadable ({e}); street will be None")
-                self.blocks["street"] = None
-        else:
-            self.blocks["street"] = None
 
         # Freeze the neighborhood category set to what training saw.
         # Unknown categories at inference become NaN → surrogate splits.
@@ -227,6 +242,9 @@ class BlockPrediction(BaseModel):
     available_spaces_estimate: int
     demand_level: str
     color: str
+    # "metered"  — block has SFpark training labels, prediction is direct
+    # "inferred" — non-metered blockface, prediction via neighborhood baseline
+    coverage: str = "metered"
 
 
 class BlocksResponse(BaseModel):
@@ -340,6 +358,25 @@ def _build_features(
     df = df.merge(bundle.static, on=["lat", "lon"], how="left")
     df = df.merge(bundle.cit_med, on=["hour", "day_of_week"], how="left")
 
+    # Inferred (non-metered) blocks miss the per-(lat, lon) join above. Fill
+    # the resulting NaNs with this block's KNN-derived per-(cnn, hour, dow)
+    # baseline (distance-weighted average of the K=5 nearest metered blocks)
+    # before the global-mean fallback. cnn is populated only on inferred rows
+    # so this is effectively a left-join scoped to that subset.
+    if bundle.inferred_aggs is not None and "cnn" in df.columns:
+        infa = bundle.inferred_aggs.rename(
+            columns={
+                "block_hour_dow_mean": "_inf_bhd",
+                "block_hour_mean": "_inf_bh",
+                "block_mean": "_inf_bm",
+            }
+        )
+        df = df.merge(infa, on=["cnn", "hour", "day_of_week"], how="left")
+        df["block_hour_dow_mean"] = df["block_hour_dow_mean"].fillna(df["_inf_bhd"])
+        df["block_hour_mean"] = df["block_hour_mean"].fillna(df["_inf_bh"])
+        df["block_mean"] = df["block_mean"].fillna(df["_inf_bm"])
+        df = df.drop(columns=["_inf_bhd", "_inf_bh", "_inf_bm"])
+
     # Lags stay NaN: lag_history ends at the training split and no live feed
     # is wired yet. LightGBM uses surrogate splits for missing features.
     for col in LAG_COLS:
@@ -408,6 +445,10 @@ def predict_blocks(req: BlocksRequest):
         # still gets a usable answer.
         nearby = blocks.sort_values("distance_m").head(8)
 
+    # Cap the result list — the citywide universe makes it possible to match
+    # thousands of blocks within a 2km radius downtown.
+    nearby = nearby.head(MAX_BLOCKS_RETURNED)
+
     feat_df = _build_features(nearby, target_hour, req, BUNDLE)
     preds = _predict_rows(feat_df, BUNDLE)
 
@@ -429,6 +470,7 @@ def predict_blocks(req: BlocksRequest):
                 available_spaces_estimate=avail,
                 demand_level=_demand_level(pct),
                 color=_color(pct),
+                coverage=str(row["coverage"]) if "coverage" in row and pd.notna(row.get("coverage")) else "metered",
             )
         )
 
