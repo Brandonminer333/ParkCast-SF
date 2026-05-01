@@ -26,7 +26,7 @@ export default function HistoryTable({ history }) {
             <tr key={entry.id} className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors">
               <td className="py-2 text-gray-500 text-xs">{entry.timestamp}</td>
               <td className="py-2 text-white capitalize">{entry.neighborhood}</td>
-              <td className="py-2 text-gray-300">{entry.hour === 0 ? 12 : entry.hour > 12 ? entry.hour - 12 : entry.hour}:00 {entry.hour < 12 ? 'AM' : 'PM'}</td>
+              <td className="py-2 text-gray-300">{entry.hour}:00</td>
               <td className="py-2">
                 <div className="flex items-center gap-2">
                   <div className="w-16 bg-gray-800 rounded-full h-1.5">

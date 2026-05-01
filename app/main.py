@@ -142,7 +142,9 @@ class ModelBundle:
         # build_full_blocks.ipynb populates `cnn` on every block (including
         # metered ones via spatial-join), so an exact key merge replaces the
         # older KDTree-with-tolerance fallback that missed ~1.3% of long
-        # downtown blocks. Falls back to None if master_blocks isn't present.
+        # downtown blocks. Blocks that fail the join (no real street name)
+        # are *dropped* from the served catalog so the API never returns a
+        # null or "Unknown" street label to the frontend.
         self.blocks["street"] = None
         master_path = os.path.join(src, "master_blocks.parquet")
         if os.path.exists(master_path) and "cnn" in self.blocks.columns:
@@ -152,20 +154,26 @@ class ModelBundle:
                 blocks_cnn = self.blocks["cnn"].astype("Int64")
                 lookup = master.set_index("cnn")
                 corridors = blocks_cnn.map(lookup["corridor"])
-                limits = blocks_cnn.map(lookup["limits"])
+                limits_s = blocks_cnn.map(lookup["limits"])
 
-                def _street(c, l):
-                    if pd.notna(c) and pd.notna(l):
-                        return f"{c} ({l})"
+                def _street(c, lim):
+                    if pd.notna(c) and pd.notna(lim):
+                        return f"{c} ({lim})"
                     if pd.notna(c):
                         return str(c)
                     return None
 
-                self.blocks["street"] = [_street(c, l) for c, l in zip(corridors, limits)]
-                matched = self.blocks["street"].notna().sum()
-                logger.info(f"  street enrichment matched {matched:,}/{len(self.blocks):,} blocks (cnn join)")
+                self.blocks["street"] = [_street(c, lim) for c, lim in zip(corridors, limits_s)]
             except Exception as e:
-                logger.warning(f"master_blocks.parquet unreadable ({e}); street will be None")
+                logger.warning(f"master_blocks.parquet unreadable ({e}); all blocks will be dropped")
+
+        before = len(self.blocks)
+        self.blocks = self.blocks[self.blocks["street"].notna()].reset_index(drop=True)
+        dropped = before - len(self.blocks)
+        logger.info(
+            f"  street enrichment: kept {len(self.blocks):,}/{before:,} blocks, "
+            f"dropped {dropped} without a real street label"
+        )
 
         # Freeze the neighborhood category set to what training saw.
         # Unknown categories at inference become NaN → surrogate splits.
