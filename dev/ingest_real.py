@@ -4,7 +4,7 @@ Uses actual SFpark sensor data from SF Open Data API (no synthetic fallback)
 
 Real data sources:
   1. SF Open Data — Parking meter transactions (real occupancy data)
-  2. SF Open Data — Street sweeping schedule  
+  2. SF Open Data — Street sweeping schedule
   3. SF Open Data — Public events permits
   4. Open-Meteo   — Historical SF weather
   5. Nager.at     — US federal holidays
@@ -122,8 +122,12 @@ def fetch_sfpark_real():
     agg["street"] = agg["block_id"].str.replace("_", " ").str.title()
 
     # Add lat/lon from block lookup
-    agg["lat"] = agg["neighborhood"].map(NEIGHBORHOOD_COORDS).apply(lambda x: x[0] if x else 37.7749)
-    agg["lon"] = agg["neighborhood"].map(NEIGHBORHOOD_COORDS).apply(lambda x: x[1] if x else -122.4194)
+    agg["lat"] = (
+        agg["neighborhood"].map(NEIGHBORHOOD_COORDS).apply(lambda x: x[0] if x else 37.7749)
+    )
+    agg["lon"] = (
+        agg["neighborhood"].map(NEIGHBORHOOD_COORDS).apply(lambda x: x[1] if x else -122.4194)
+    )
 
     print(f"  Aggregated to {len(agg)} block-hour records from real data")
     return agg
@@ -190,26 +194,26 @@ NEIGHBORHOOD_COORDS = {
     "unknown": (37.7749, -122.4194),
 }
 
+# Keyword → neighborhood mapping (first match wins).
+_BLOCK_KEYWORDS: dict[str, list[str]] = {
+    "mission": ["mission", "valencia", "guerrero", "24th", "16th"],
+    "soma": ["folsom", "howard", "brannan", "soma", "3rd", "4th", "5th"],
+    "castro": ["castro", "18th", "19th", "market"],
+    "marina": ["chestnut", "lombard", "marina", "union"],
+    "tenderloin": ["turk", "ellis", "eddy", "tenderloin", "leavenworth"],
+    "haight": ["haight", "ashbury", "masonic"],
+    "richmond": ["clement", "geary", "richmond", "balboa"],
+}
+
 
 def map_block_to_neighborhood(block_name):
-    """Map a street block name to SF neighborhood."""
+    """Map a street block name to SF neighborhood via keyword lookup."""
     if not block_name:
         return "unknown"
     b = str(block_name).lower()
-    if any(x in b for x in ["mission", "valencia", "guerrero", "24th", "16th"]):
-        return "mission"
-    if any(x in b for x in ["folsom", "howard", "brannan", "soma", "3rd", "4th", "5th"]):
-        return "soma"
-    if any(x in b for x in ["castro", "18th", "19th", "market"]):
-        return "castro"
-    if any(x in b for x in ["chestnut", "lombard", "marina", "union"]):
-        return "marina"
-    if any(x in b for x in ["turk", "ellis", "eddy", "tenderloin", "leavenworth"]):
-        return "tenderloin"
-    if any(x in b for x in ["haight", "ashbury", "masonic"]):
-        return "haight"
-    if any(x in b for x in ["clement", "geary", "richmond", "balboa"]):
-        return "richmond"
+    for neighborhood, keywords in _BLOCK_KEYWORDS.items():
+        if any(kw in b for kw in keywords):
+            return neighborhood
     return "unknown"
 
 
@@ -256,7 +260,11 @@ def fetch_sf_events():
             dt = d.get("start_date_time", "")[:10]
             if dt:
                 records.append(
-                    {"event_date": dt, "has_event": 1, "neighborhood": d.get("neighborhoods_sic_district", "unknown")}
+                    {
+                        "event_date": dt,
+                        "has_event": 1,
+                        "neighborhood": d.get("neighborhoods_sic_district", "unknown"),
+                    }
                 )
         df = pd.DataFrame(records)
         print(f"  SF Events: {len(df)} records")
@@ -369,7 +377,9 @@ def merge_all(sfpark_df, events_df, weather_df, holidays_df, school_df):
 
     # Ensure date column exists
     if "date" not in df.columns:
-        df["date"] = pd.to_datetime(df.get("session_start_dt", datetime.now())).dt.strftime(DATE_FMT)
+        df["date"] = pd.to_datetime(df.get("session_start_dt", datetime.now())).dt.strftime(
+            DATE_FMT
+        )
 
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
     df["is_rush_hour"] = df["hour"].apply(lambda h: 1 if (7 <= h <= 9 or 17 <= h <= 19) else 0)
@@ -378,7 +388,9 @@ def merge_all(sfpark_df, events_df, weather_df, holidays_df, school_df):
     # Merge weather
     if not weather_df.empty:
         df = df.merge(
-            weather_df[["date", "hour", "temperature", "is_raining", "bad_weather"]], on=["date", "hour"], how="left"
+            weather_df[["date", "hour", "temperature", "is_raining", "bad_weather"]],
+            on=["date", "hour"],
+            how="left",
         )
     else:
         df["is_raining"] = 0

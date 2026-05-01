@@ -1,14 +1,69 @@
 [tool.black]
-line-length = 120
-target-version = ['py311']
+line-length = 100
+target-version = ["py310", "py311"]
 include = '\.pyi?$'
-exclude = '''
+extend-exclude = '''
 /(
     \.git
   | \.venv
+  | venv
   | build
   | dist
-  | node_modules
   | parkcast-frontend
+  | models
+  | data
+  | \.ipynb_checkpoints
 )/
 '''
+
+[tool.pylint.main]
+jobs = 0
+py-version = "3.10"
+ignore-paths = [
+    "^parkcast-frontend/.*$",
+    "^models/.*$",
+    "^data/.*$",
+    "^dev/.*$",
+    "^docs/.*$",
+]
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint."messages control"]
+# Relaxations appropriate for a FastAPI/ML service: global model state,
+# many features per row, long float literals, etc.
+disable = [
+    "missing-module-docstring",
+    "missing-function-docstring",
+    "missing-class-docstring",
+    "too-few-public-methods",
+    "too-many-locals",
+    "too-many-arguments",
+    "too-many-positional-arguments",
+    "too-many-branches",
+    "too-many-statements",
+    "too-many-instance-attributes",
+    "too-many-return-statements",
+    "broad-except",
+    "global-statement",
+    "invalid-name",
+    "logging-fstring-interpolation",
+    "duplicate-code",
+]
+
+[tool.pylint.design]
+max-line-length = 100
+
+[tool.pylint.reports]
+score = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "unit: pure-function tests with no FastAPI app, no fixtures, and no I/O",
+    "functional: single-endpoint tests via TestClient with an in-memory fake model and parking DB",
+    "integration: in-process tests against the real model + real parquet assets + real Open-Meteo weather API",
+    "application: end-to-end tests against a live uvicorn server bound to a localhost port",
+]

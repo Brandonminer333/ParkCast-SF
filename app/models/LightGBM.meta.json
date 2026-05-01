@@ -1,0 +1,66 @@
+{
+  "features": [
+    "hour",
+    "day_of_week",
+    "month",
+    "is_weekend",
+    "is_holiday",
+    "is_school_day",
+    "is_raining",
+    "temperature",
+    "event_intensity",
+    "citation_count",
+    "citations_hourly_median",
+    "complaints_311_median",
+    "complaints_311_total",
+    "poi_dining_200m",
+    "poi_retail_200m",
+    "poi_transit_200m",
+    "poi_attraction_200m",
+    "sfpark_block_occ",
+    "permit_active",
+    "permit_count_30d",
+    "lat",
+    "lon",
+    "total_spaces",
+    "block_mean",
+    "block_hour_mean",
+    "lag_1d",
+    "lag_2d",
+    "lag_7d",
+    "lag_14d",
+    "lag_28d",
+    "neighborhood"
+  ],
+  "target": "occupancy_pct",
+  "split_time": "2026-01-27 18:00:00",
+  "train_rows": 4058771,
+  "val_rows": 450975,
+  "test_rows": 1127664,
+  "best_iteration": 2901,
+  "global_mean": 35.08501694232078,
+  "metrics": {
+    "baseline": {
+      "n": 1127664,
+      "mae": 10.331540010594845,
+      "r2": 0.6283494879530397
+    },
+    "residual_model": {
+      "n": 1127664,
+      "mae": 9.121732100087739,
+      "r2": 0.7277434923807339
+    },
+    "baseline_events": {
+      "n": 6321,
+      "mae": 10.010959728523114,
+      "r2": 0.6160846403855176
+    },
+    "residual_events": {
+      "n": 6321,
+      "mae": 8.986368735039528,
+      "r2": 0.6911779179234891
+    },
+    "winner": "residual_model"
+  },
+  "note": "Trained only on real meter-hour rows. Off-hour predictions are out of scope for this model."
+}
