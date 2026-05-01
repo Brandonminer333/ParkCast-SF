@@ -2,26 +2,13 @@
 
 > Predict where to park in San Francisco — before you leave.
 
-ParkCast SF is a machine learning web service that predicts parking occupancy 30–60 minutes ahead using historical sensor data, weather, events, and time patterns.
+ParkCast SF is a machine learning web service that predicts parking occupancy ahead of your trip using historical sensor data, weather, events, and time patterns.
 
 ---
 
-## Team
-
-**Group:** Parkcast SF
-**Members:** 
-
-**Brandon Miner**
-HEAD
-**Kyvan Zahiri**
-
-
-**Kayvan Zahiri**
-
-refs/remotes/origin/main
-**Temesghen Kahsay**
-
----
+<video width="1280" height="960" controls>
+  <source src="docs/demo-video.mov" type="video/mp4">
+</video>
 
 ## Project Structure
 
@@ -78,17 +65,26 @@ parcast/
 
 ---
 
+## Team
+
+**Group:** Parkcast SF
+**Members:** 
+
+**Brandon Miner**
+HEAD
+**Kyvan Zahiri**
+
+
+**Kayvan Zahiri**
+
+refs/remotes/origin/main
+**Temesghen Kahsay**
+
+---
 ## How to Run Locally (without Docker)
 
 **1. Clone the repo:**
 ```bash
-<<<<<<< HEAD
-git clone https://github.com/YOUR_USERNAME/parcast.git
-cd parcast
-=======
-git clone https://github.com/YOUR_USERNAME/parkcast.git
-cd parkcast
->>>>>>> refs/remotes/origin/main
 ```
 
 **2. Create and activate virtual environment:**
@@ -214,3 +210,4 @@ All experiments are tracked on a shared GCP MLflow server.
 | Containerization | Docker |
 | Image Registry | Docker Hub |
 | Cloud VM | Google Compute Engine |
+

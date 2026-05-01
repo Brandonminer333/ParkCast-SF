@@ -14,3 +14,6 @@ node_modules/
 parkcast-frontend/.env.local
 
 *.csv
+
+# Keep large demo videos local (GitHub blocks >100MB without LFS)
+docs/demo-video.mov
