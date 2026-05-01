@@ -59,6 +59,33 @@ fetch sf_centerlines.json       3psu-pn9h    50000
 fetch meter_locations.csv       8vzz-qzz9   100000
 fetch parking_citations.csv     ab4h-6ztd  3000000
 
+# Weather: Open-Meteo Archive API (not DataSF). Rolling 365-day window of
+# hourly observations for SF center. preprocess_real_data.ipynb reads
+# weather.csv; weather_raw.json is the unflattened source-of-truth.
+echo "  weather.csv (Open-Meteo Archive, rolling 365 days)"
+python3 - "$PROJECT_DIR/data" <<'PY'
+import datetime, json, os, sys, urllib.request
+import pandas as pd
+out_dir = sys.argv[1]
+end = datetime.date.today()
+start = end - datetime.timedelta(days=365)
+url = (
+    "https://archive-api.open-meteo.com/v1/archive"
+    "?latitude=37.7749&longitude=-122.4194"
+    f"&start_date={start.isoformat()}&end_date={end.isoformat()}"
+    "&hourly=temperature_2m,relative_humidity_2m,precipitation,rain,weathercode,windspeed_10m,cloudcover"
+    "&timezone=auto"
+)
+print(f"    range: {start} → {end}")
+with urllib.request.urlopen(url, timeout=120) as r:
+    data = json.load(r)
+with open(os.path.join(out_dir, "weather_raw.json"), "w") as f:
+    json.dump(data, f)
+df = pd.DataFrame(data["hourly"])
+df.to_csv(os.path.join(out_dir, "weather.csv"), index=False)
+print(f"    saved weather.csv ({len(df):,} hourly rows)")
+PY
+
 cd "$PROJECT_DIR/dev"
 
 log "1/12 Fetching SFMTA meter transactions (download_12mo_transactions.ipynb)"
