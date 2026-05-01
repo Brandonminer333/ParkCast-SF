@@ -1,15 +1,14 @@
 """Unit tests for pure helper functions in `app.main`.
 
 These tests exercise single functions with no FastAPI app, no TestClient, and
-no module-global swapping. Importing `app.main` is cheap because asset loading
-is deferred to FastAPI's lifespan hook, not module import time.
+no module-global swapping. Importing `app.main` is cheap because the
+ModelBundle constructor's failure is caught and logged, not re-raised.
 """
 
 from __future__ import annotations
 
 import pathlib
 import sys
-from datetime import date
 
 import pytest
 
@@ -17,7 +16,7 @@ _repo_root = pathlib.Path(__file__).resolve().parents[1]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from app.main import color_for, demand_level, is_school_day  # noqa: E402
+from app.main import _color, _demand_level, _recommendation  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -36,7 +35,7 @@ pytestmark = pytest.mark.unit
     ],
 )
 def test_demand_level_boundaries(occ, expected):
-    assert demand_level(occ) == expected
+    assert _demand_level(occ) == expected
 
 
 @pytest.mark.parametrize(
@@ -49,11 +48,17 @@ def test_demand_level_boundaries(occ, expected):
     ],
 )
 def test_color_matches_legend(occ, expected_hex):
-    assert color_for(occ) == expected_hex
+    assert _color(occ) == expected_hex
 
 
-def test_is_school_day_heuristic():
-    assert is_school_day(date(2026, 3, 4)) == 1
-    assert is_school_day(date(2026, 3, 7)) == 0
-    assert is_school_day(date(2026, 7, 15)) == 0
-    assert is_school_day(date(2026, 1, 1)) == 0
+@pytest.mark.parametrize(
+    "occ,expected_prefix",
+    [
+        (10, "Easy to park"),
+        (55, "Good chance"),
+        (77, "Limited spots"),
+        (95, "Very hard to park"),
+    ],
+)
+def test_recommendation_text(occ, expected_prefix):
+    assert _recommendation(occ).startswith(expected_prefix)

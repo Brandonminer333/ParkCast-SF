@@ -1,6 +1,10 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import SF_LOCATIONS from './data/sfLocations';
+import SearchBar from './components/SearchBar';
+import TimePicker from './components/TimePicker';
+import BlockList from './components/BlockList';
 
 export default function MapPage() {
   const mapRef = useRef(null);
@@ -8,7 +12,6 @@ export default function MapPage() {
   const markersRef = useRef([]);
   const destMarkerRef = useRef(null);
   const userMarkerRef = useRef(null);
-  const routeLayerRef = useRef(null);
   const circleRef = useRef(null);
   const driveRouteRef = useRef(null);
   const walkRouteRef = useRef(null);
@@ -24,21 +27,21 @@ export default function MapPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [selectedBlock, setSelectedBlock] = useState(null);
-  const [routeInfo, setRouteInfo] = useState(null);  // {driveMin, walkMin}
-  const [driveSteps, setDriveSteps] = useState([]); // OSRM turn-by-turn steps
+  const [routeInfo, setRouteInfo] = useState(null);
+  const [driveSteps, setDriveSteps] = useState([]);
   const [bestBlockIndex, setBestBlockIndex] = useState(0);
   const [apiStatus, setApiStatus] = useState(null);
   const [showTimePicker, setShowTimePicker] = useState(false);
   const [hour, setHour] = useState(now.getHours());
   const [minutesAway, setMinutesAway] = useState(0);
   const [conditions, setConditions] = useState({
-    is_raining: 0, has_nearby_event: 0,
+    is_raining: 0, event_intensity: 0,
     is_holiday: 0, is_school_day: 1,
     temperature: 62, month: now.getMonth() + 1,
     day_of_week: now.getDay() === 0 ? 6 : now.getDay() - 1,
   });
 
-  // Auto-fetch weather conditions based on current time
+  // ── Auto-fetch weather ────────────────────────────────────────
   useEffect(() => {
     fetch('https://api.open-meteo.com/v1/forecast?latitude=37.7749&longitude=-122.4194&current=temperature_2m,precipitation,weathercode&temperature_unit=fahrenheit&timezone=America%2FLos_Angeles')
       .then(r => r.json())
@@ -48,36 +51,34 @@ export default function MapPage() {
           ...prev,
           temperature:  current.temperature_2m || 62,
           is_raining:   (current.precipitation || 0) > 0.1 ? 1 : 0,
-          bad_weather:  (current.weathercode || 0) >= 51 ? 1 : 0,
         }));
       })
-      .catch(() => {}); // silently fail — use defaults
+      .catch(() => {});
   }, []);
 
-  // Get user's current location
+  // ── User geolocation ──────────────────────────────────────────
   useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => setUserLocation({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
-        () => setUserLocation({ lat: 37.7749, lon: -122.4194 }) // default SF center
+        () => setUserLocation({ lat: 37.7749, lon: -122.4194 })
       );
     }
   }, []);
 
-  // Load Leaflet
+  // ── Leaflet loading ───────────────────────────────────────────
   useEffect(() => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
     link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
     document.head.appendChild(link);
-
     const script = document.createElement('script');
     script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
     script.onload = () => setLeafletLoaded(true);
     document.head.appendChild(script);
   }, []);
 
-  // Init map
+  // ── Map init ──────────────────────────────────────────────────
   useEffect(() => {
     if (!leafletLoaded || !mapRef.current || mapInstanceRef.current) return;
     const L = window.L;
@@ -88,7 +89,7 @@ export default function MapPage() {
     mapInstanceRef.current = map;
   }, [leafletLoaded]);
 
-  // Show user location on map
+  // ── User location marker ──────────────────────────────────────
   useEffect(() => {
     if (!mapInstanceRef.current || !leafletLoaded || !userLocation) return;
     const L = window.L;
@@ -102,13 +103,12 @@ export default function MapPage() {
       .bindPopup('Your location');
   }, [userLocation, leafletLoaded]);
 
-  // Show destination marker
+  // ── Destination marker + radius circle ────────────────────────
   useEffect(() => {
     if (!mapInstanceRef.current || !leafletLoaded || !destination) return;
     const L = window.L;
     if (destMarkerRef.current) destMarkerRef.current.remove();
     if (circleRef.current) circleRef.current.remove();
-
     const icon = L.divIcon({
       html: `<div style="width:20px;height:20px;border-radius:50%;background:#0d9488;border:3px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.4)"></div>`,
       iconSize: [20, 20], iconAnchor: [10, 10], className: '',
@@ -116,94 +116,19 @@ export default function MapPage() {
     destMarkerRef.current = L.marker([destination.lat, destination.lon], { icon })
       .addTo(mapInstanceRef.current)
       .bindPopup(`<b>${destination.name}</b>`);
-
     circleRef.current = L.circle([destination.lat, destination.lon], {
       radius: 600, color: '#0d9488', fillColor: '#0d9488',
       fillOpacity: 0.05, weight: 1, dashArray: '4 4',
     }).addTo(mapInstanceRef.current);
-
     mapInstanceRef.current.setView([destination.lat, destination.lon], 15);
   }, [destination, leafletLoaded]);
 
-  // Draw routes when a block is selected
-  const drawBlockRoutes = async (block) => {
-    if (!mapInstanceRef.current || !leafletLoaded) return;
-    const L = window.L;
-
-    // Clear old routes
-    if (driveRouteRef.current) driveRouteRef.current.remove();
-    if (walkRouteRef.current) walkRouteRef.current.remove();
-    setRouteInfo(null);
-    setDriveSteps([]);
-
-    // Drive route: user location → parking block. Calls our /api/route proxy
-    // which uses Mapbox driving-traffic server-side (so the token never ends
-    // up in the browser bundle).
-    if (userLocation) {
-      try {
-        const driveUrl = `/api/route?profile=driving-traffic&coords=${userLocation.lon},${userLocation.lat};${block.lon},${block.lat}`;
-        const driveRes = await fetch(driveUrl);
-        const driveData = await driveRes.json();
-        if (driveData.routes && driveData.routes[0]) {
-          const coords = driveData.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon]);
-          driveRouteRef.current = L.polyline(coords, {
-            color: '#0d9488', weight: 5, opacity: 0.85,
-          }).addTo(mapInstanceRef.current);
-          const driveSec = driveData.routes[0].duration;
-          const driveMin = Math.ceil(driveSec / 60);
-
-          // Pull turn-by-turn steps from the first (and only) leg.
-          const rawSteps = driveData.routes[0].legs?.[0]?.steps || [];
-          setDriveSteps(rawSteps);
-          const driveMi = driveData.routes[0].distance / 1609.344;
-
-          // Walk route: parking block → destination
-          let walkMin = null;
-          if (destination) {
-            try {
-              const walkUrl = `/api/route?profile=walking&coords=${block.lon},${block.lat};${destination.lon},${destination.lat}`;
-              const walkRes = await fetch(walkUrl);
-              const walkData = await walkRes.json();
-              if (walkData.routes && walkData.routes[0]) {
-                const walkCoords = walkData.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon]);
-                walkRouteRef.current = L.polyline(walkCoords, {
-                  color: '#ffffff', weight: 3, opacity: 0.8, dashArray: '6 5',
-                }).addTo(mapInstanceRef.current);
-                walkMin = Math.ceil(walkData.routes[0].duration / 60);
-              }
-            } catch {}
-          }
-          setRouteInfo({ driveMin, walkMin, driveMi });
-        }
-      } catch {}
-    }
-
-    // Fit map to show full journey
-    const map = mapInstanceRef.current;
-    const points = [];
-    if (userLocation) points.push([userLocation.lat, userLocation.lon]);
-    points.push([block.lat, block.lon]);
-    if (destination) points.push([destination.lat, destination.lon]);
-    if (points.length > 1) map.fitBounds(L.latLngBounds(points), { padding: [60, 60] });
-  };
-
-  // Clear routes when blocks list changes
-  useEffect(() => {
-    if (driveRouteRef.current) driveRouteRef.current.remove();
-    if (walkRouteRef.current) walkRouteRef.current.remove();
-    setRouteInfo(null);
-    setDriveSteps([]);
-    setSelectedBlock(null);
-    setBestBlockIndex(0);
-  }, [blocks]);
-
-  // Render block markers
+  // ── Block markers ─────────────────────────────────────────────
   useEffect(() => {
     if (!mapInstanceRef.current || !leafletLoaded) return;
     const L = window.L;
     markersRef.current.forEach(m => m.remove());
     markersRef.current = [];
-
     blocks.forEach(block => {
       const icon = L.divIcon({
         html: `<div style="
@@ -215,7 +140,6 @@ export default function MapPage() {
         ">${Math.round(block.predicted_occupancy_pct)}%</div>`,
         className: '', iconAnchor: [20, 20],
       });
-
       const marker = L.marker([block.lat, block.lon], { icon })
         .addTo(mapInstanceRef.current)
         .bindPopup(`
@@ -227,85 +151,85 @@ export default function MapPage() {
             <span style="color:#888;font-size:11px">${(block.distance_meters / 1609.344).toFixed(2)} mi from destination</span>
           </div>
         `);
-
       marker.on('click', () => setSelectedBlock(block));
       markersRef.current.push(marker);
     });
   }, [blocks, leafletLoaded]);
 
-  // Check API health
+  // ── Clear routes when blocks change ───────────────────────────
+  useEffect(() => {
+    if (driveRouteRef.current) driveRouteRef.current.remove();
+    if (walkRouteRef.current) walkRouteRef.current.remove();
+    setRouteInfo(null);
+    setDriveSteps([]);
+    setSelectedBlock(null);
+    setBestBlockIndex(0);
+  }, [blocks]);
+
+  // ── API health check ──────────────────────────────────────────
   useEffect(() => {
     fetch('/api/health').then(r => r.json()).then(setApiStatus).catch(() => setApiStatus({ status: 'unavailable' }));
   }, []);
 
-  // SF location database — no external API, works offline
-  const SF_LOCATIONS = [
-    {name:"USF Folger Building (101 Howard St)",addr:"101 Howard St",lat:37.7911,lon:-122.3926},
-    {name:"University of San Francisco",addr:"2130 Fulton St",lat:37.7764,lon:-122.4511},
-    {name:"SF State University",addr:"1600 Holloway Ave",lat:37.7246,lon:-122.4784},
-    {name:"UC Hastings Law School",addr:"200 McAllister St",lat:37.7793,lon:-122.4177},
-    {name:"Chase Center",addr:"1 Warriors Way",lat:37.7680,lon:-122.3877},
-    {name:"Oracle Park (Giants)",addr:"24 Willie Mays Plaza",lat:37.7786,lon:-122.3893},
-    {name:"Caltrain Station",addr:"700 4th St",lat:37.7764,lon:-122.3952},
-    {name:"Embarcadero BART",addr:"Embarcadero",lat:37.7929,lon:-122.3966},
-    {name:"Powell St BART",addr:"Powell St",lat:37.7844,lon:-122.4079},
-    {name:"Civic Center BART",addr:"Civic Center",lat:37.7797,lon:-122.4143},
-    {name:"16th St BART",addr:"16th St Mission",lat:37.7651,lon:-122.4197},
-    {name:"24th St BART",addr:"24th St Mission",lat:37.7524,lon:-122.4184},
-    {name:"UCSF Medical Center",addr:"505 Parnassus Ave",lat:37.7630,lon:-122.4578},
-    {name:"UCSF Mission Bay",addr:"1975 4th St",lat:37.7631,lon:-122.3913},
-    {name:"Zuckerberg SF General Hospital",addr:"1001 Potrero Ave",lat:37.7553,lon:-122.4058},
-    {name:"St Marys Medical Center",addr:"450 Stanyan St",lat:37.7723,lon:-122.4545},
-    {name:"Golden Gate Park",addr:"Golden Gate Park",lat:37.7694,lon:-122.4862},
-    {name:"Dolores Park",addr:"Dolores Park",lat:37.7596,lon:-122.4269},
-    {name:"Alamo Square (Painted Ladies)",addr:"Alamo Square",lat:37.7762,lon:-122.4344},
-    {name:"Fishermans Wharf",addr:"Fishermans Wharf",lat:37.8080,lon:-122.4177},
-    {name:"Pier 39",addr:"Pier 39",lat:37.8087,lon:-122.4098},
-    {name:"Coit Tower",addr:"Telegraph Hill",lat:37.8024,lon:-122.4058},
-    {name:"Moscone Center",addr:"747 Howard St",lat:37.7845,lon:-122.4004},
-    {name:"SF City Hall",addr:"1 Dr Carlton B Goodlett Pl",lat:37.7793,lon:-122.4193},
-    {name:"Ferry Building",addr:"1 Ferry Building",lat:37.7956,lon:-122.3935},
-    {name:"Salesforce Tower",addr:"415 Mission St",lat:37.7895,lon:-122.3973},
-    {name:"Transamerica Pyramid",addr:"600 Montgomery St",lat:37.7952,lon:-122.4028},
-    {name:"Westfield SF Centre",addr:"865 Market St",lat:37.7841,lon:-122.4079},
-    {name:"Castro District",addr:"Castro St & 18th St",lat:37.7609,lon:-122.4350},
-    {name:"Mission District",addr:"16th St & Valencia St",lat:37.7645,lon:-122.4211},
-    {name:"Haight-Ashbury",addr:"Haight St & Ashbury St",lat:37.7694,lon:-122.4469},
-    {name:"North Beach",addr:"Columbus Ave & Broadway",lat:37.7990,lon:-122.4070},
-    {name:"Chinatown",addr:"Grant Ave & California St",lat:37.7941,lon:-122.4078},
-    {name:"Union Square",addr:"Union Square",lat:37.7879,lon:-122.4075},
-    {name:"SoMa (South of Market)",addr:"Folsom St & 4th St",lat:37.7816,lon:-122.3975},
-    {name:"Marina District",addr:"Chestnut St & Fillmore St",lat:37.8003,lon:-122.4360},
-    {name:"Noe Valley",addr:"24th St & Noe St",lat:37.7502,lon:-122.4298},
-    {name:"Richmond District",addr:"Clement St & 3rd Ave",lat:37.7830,lon:-122.4638},
-    {name:"Sunset District",addr:"Irving St & 9th Ave",lat:37.7644,lon:-122.4658},
-    {name:"Tenderloin",addr:"Turk St & Hyde St",lat:37.7836,lon:-122.4148},
-    {name:"Hayes Valley",addr:"Hayes St & Octavia St",lat:37.7764,lon:-122.4238},
-    {name:"Japantown",addr:"Post St & Buchanan St",lat:37.7852,lon:-122.4308},
-    {name:"Dogpatch",addr:"3rd St & 22nd St",lat:37.7578,lon:-122.3888},
-    {name:"Potrero Hill",addr:"18th St & Connecticut St",lat:37.7622,lon:-122.4038},
-    {name:"Bernal Heights",addr:"Cortland Ave",lat:37.7396,lon:-122.4168},
-    {name:"SFO Airport",addr:"San Francisco International Airport",lat:37.6213,lon:-122.3790},
-    {name:"Fillmore Street",addr:"Fillmore St & Union St",lat:37.7984,lon:-122.4330},
-    {name:"Howard Street",addr:"Howard St SoMa",lat:37.7820,lon:-122.3968},
-    {name:"Market Street",addr:"Market St Downtown",lat:37.7879,lon:-122.4075},
-    {name:"Valencia Street",addr:"Valencia St Mission",lat:37.7645,lon:-122.4211},
-  ];
+  // ── Route drawing ─────────────────────────────────────────────
+  const drawBlockRoutes = async (block) => {
+    if (!mapInstanceRef.current || !leafletLoaded) return;
+    const L = window.L;
+    if (driveRouteRef.current) driveRouteRef.current.remove();
+    if (walkRouteRef.current) walkRouteRef.current.remove();
+    setRouteInfo(null);
+    setDriveSteps([]);
 
+    if (userLocation) {
+      try {
+        const driveUrl = `/api/route?profile=driving-traffic&coords=${userLocation.lon},${userLocation.lat};${block.lon},${block.lat}`;
+        const driveRes = await fetch(driveUrl);
+        const driveData = await driveRes.json();
+        if (driveData.routes?.[0]) {
+          const coords = driveData.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+          driveRouteRef.current = L.polyline(coords, { color: '#0d9488', weight: 5, opacity: 0.85 }).addTo(mapInstanceRef.current);
+          const driveMin = Math.ceil(driveData.routes[0].duration / 60);
+          setDriveSteps(driveData.routes[0].legs?.[0]?.steps || []);
+          const driveMi = driveData.routes[0].distance / 1609.344;
+
+          let walkMin = null;
+          if (destination) {
+            try {
+              const walkUrl = `/api/route?profile=walking&coords=${block.lon},${block.lat};${destination.lon},${destination.lat}`;
+              const walkRes = await fetch(walkUrl);
+              const walkData = await walkRes.json();
+              if (walkData.routes?.[0]) {
+                const walkCoords = walkData.routes[0].geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+                walkRouteRef.current = L.polyline(walkCoords, { color: '#ffffff', weight: 3, opacity: 0.8, dashArray: '6 5' }).addTo(mapInstanceRef.current);
+                walkMin = Math.ceil(walkData.routes[0].duration / 60);
+              }
+            } catch { /* walk route is best-effort */ }
+          }
+          setRouteInfo({ driveMin, walkMin, driveMi });
+        }
+      } catch { /* drive route is best-effort */ }
+    }
+
+    const map = mapInstanceRef.current;
+    const points = [];
+    if (userLocation) points.push([userLocation.lat, userLocation.lon]);
+    points.push([block.lat, block.lon]);
+    if (destination) points.push([destination.lat, destination.lon]);
+    if (points.length > 1) map.fitBounds(L.latLngBounds(points), { padding: [60, 60] });
+  };
+
+  // ── Search logic ──────────────────────────────────────────────
   const handleQueryChange = (val) => {
     setQuery(val);
     if (val.length === 0) { setDestination(null); setSuggestions([]); return; }
     if (val.length < 2) { setSuggestions([]); return; }
     const q = val.toLowerCase();
     const matches = SF_LOCATIONS.filter(loc =>
-      loc.name.toLowerCase().includes(q) ||
-      loc.addr.toLowerCase().includes(q)
+      loc.name.toLowerCase().includes(q) || loc.addr.toLowerCase().includes(q)
     ).slice(0, 6);
     setSuggestions(matches.map(loc => ({
       display_name: `${loc.name}, ${loc.addr}, San Francisco, CA`,
-      lat: String(loc.lat),
-      lon: String(loc.lon),
-      _name: loc.name,
+      lat: String(loc.lat), lon: String(loc.lon), _name: loc.name,
     })));
     setShowSuggestions(matches.length > 0);
   };
@@ -317,31 +241,21 @@ export default function MapPage() {
     setShowSuggestions(false);
   };
 
+  // ── Predict ───────────────────────────────────────────────────
   const handlePredict = async () => {
     if (!destination) { setError('Please enter a destination first'); return; }
     setLoading(true); setError(null); setSelectedBlock(null);
-
-    const arrivalHour = showTimePicker
-      ? (hour + Math.floor(minutesAway / 60)) % 24
-      : now.getHours();
-
+    const arrivalHour = showTimePicker ? (hour + Math.floor(minutesAway / 60)) % 24 : now.getHours();
     try {
       const res = await fetch('/api/predict/blocks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          lat: destination.lat,
-          lon: destination.lon,
-          radius_meters: 1500,
-          hour: arrivalHour,
-          day_of_week: conditions.day_of_week,
-          month: conditions.month,
-          is_raining: conditions.is_raining,
-          has_nearby_event: conditions.has_nearby_event,
-          is_holiday: conditions.is_holiday,
-          is_school_day: conditions.is_school_day,
-          temperature: conditions.temperature,
-          minutes_away: showTimePicker ? minutesAway : 0,
+          lat: destination.lat, lon: destination.lon, radius_meters: 1500,
+          hour: arrivalHour, day_of_week: conditions.day_of_week, month: conditions.month,
+          is_raining: conditions.is_raining, event_intensity: conditions.event_intensity,
+          is_holiday: conditions.is_holiday, is_school_day: conditions.is_school_day,
+          temperature: conditions.temperature, minutes_away: showTimePicker ? minutesAway : 0,
         }),
       });
       if (!res.ok) throw new Error();
@@ -355,12 +269,42 @@ export default function MapPage() {
     }
   };
 
-  const demandBg = { 'Low': '#166534', 'Medium': '#854d0e', 'High': '#9a3412', 'Very High': '#7f1d1d' };
+  // ── Block selection handlers ──────────────────────────────────
+  const handleSelectBlock = (block) => {
+    if (block) {
+      setSelectedBlock(block);
+      drawBlockRoutes(block);
+    } else {
+      setSelectedBlock(null);
+      if (driveRouteRef.current) driveRouteRef.current.remove();
+      if (walkRouteRef.current) walkRouteRef.current.remove();
+      setRouteInfo(null);
+      setDriveSteps([]);
+    }
+  };
 
+  const handleNextBest = () => {
+    const sorted = [...blocks].sort((a, b) => a.predicted_occupancy_pct - b.predicted_occupancy_pct);
+    const nextIdx = (bestBlockIndex + 1) % sorted.length;
+    setBestBlockIndex(nextIdx);
+    const next = sorted[nextIdx];
+    setSelectedBlock(next);
+    drawBlockRoutes(next);
+  };
+
+  const handleBack = () => {
+    setSelectedBlock(null);
+    if (driveRouteRef.current) driveRouteRef.current.remove();
+    if (walkRouteRef.current) walkRouteRef.current.remove();
+    setRouteInfo(null);
+    setDriveSteps([]);
+  };
+
+  // ── Render ────────────────────────────────────────────────────
   return (
     <div style={{ display: 'flex', height: '100vh', background: '#0d1b2a', color: 'white', fontFamily: '-apple-system, BlinkMacSystemFont, sans-serif', overflow: 'hidden' }}>
 
-      {/* ── Sidebar ── */}
+      {/* Sidebar */}
       <div style={{ width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column', borderRight: '1px solid #1e3a52', background: '#0a1520' }}>
 
         {/* Header */}
@@ -376,83 +320,23 @@ export default function MapPage() {
           </div>
         </div>
 
-        {/* Search */}
-        <div style={{ padding: '14px 16px', borderBottom: '1px solid #1e3a52' }}>
-          <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Where are you going?</div>
-          <div style={{ position: 'relative' }}>
-            <input
-              value={query}
-              onChange={e => handleQueryChange(e.target.value)}
-              onFocus={() => suggestions.length > 0 && setShowSuggestions(true)}
-              placeholder="Search address or place..."
-              style={{
-                width: '100%', background: '#112031', border: '1px solid #1e3a52',
-                borderRadius: 8, padding: '10px 14px', color: 'white', fontSize: 13,
-                outline: 'none', boxSizing: 'border-box',
-              }}
-            />
-            {showSuggestions && suggestions.length > 0 && (
-              <div style={{
-                position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 9999,
-                background: '#112031', border: '1px solid #1e3a52', borderRadius: 8,
-                marginTop: 4, overflow: 'hidden', boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
-              }}>
-                {suggestions.map((s, i) => (
-                  <div key={i} onClick={() => handleSelectSuggestion(s)}
-                    style={{
-                      padding: '10px 14px', cursor: 'pointer', fontSize: 12,
-                      borderBottom: i < suggestions.length - 1 ? '1px solid #1e3a52' : 'none',
-                      color: '#cbd5e1',
-                    }}
-                    onMouseEnter={e => e.currentTarget.style.background = '#1e3a52'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                    <div style={{ fontWeight: 600, color: 'white', marginBottom: 2 }}>
-                      {s._name || s.display_name.split(',')[0]}
-                    </div>
-                    <div style={{ color: '#64748b', fontSize: 11 }}>
-                      {s.display_name.split(',').slice(1, 3).join(',')}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+        <SearchBar
+          query={query}
+          onQueryChange={handleQueryChange}
+          suggestions={suggestions}
+          showSuggestions={showSuggestions}
+          onShowSuggestions={setShowSuggestions}
+          onSelect={handleSelectSuggestion}
+          isRaining={conditions.is_raining === 1}
+        />
 
-          {/* Auto conditions pills */}
-          {conditions.is_raining === 1 && (
-            <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              <span style={{ fontSize: 11, padding: '3px 8px', background: '#1e3a52', borderRadius: 4, color: '#94a3b8' }}>
-                🌧 Raining detected
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Leave now / later toggle */}
-        <div style={{ padding: '12px 16px', borderBottom: '1px solid #1e3a52' }}>
-          <button onClick={() => setShowTimePicker(!showTimePicker)}
-            style={{
-              width: '100%', padding: '8px 14px', borderRadius: 7,
-              border: '1px solid #1e3a52', background: showTimePicker ? '#112031' : 'transparent',
-              color: showTimePicker ? '#14b8a6' : '#64748b', fontSize: 12, cursor: 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            }}>
-            <span>{showTimePicker ? `Leaving in ${minutesAway} min (arriving ~${(hour + Math.floor(minutesAway/60)) % 24}:${String(minutesAway % 60).padStart(2,'0')})` : 'Leaving now'}</span>
-            <span style={{ fontSize: 10 }}>{showTimePicker ? '▲' : '▼ Plan ahead'}</span>
-          </button>
-
-          {showTimePicker && (
-            <div style={{ marginTop: 10, padding: '12px', background: '#112031', borderRadius: 8 }}>
-              <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>Leaving in: <b style={{ color: '#14b8a6' }}>{minutesAway} minutes</b></div>
-              <input type="range" min={0} max={120} step={5} value={minutesAway}
-                onChange={e => { setMinutesAway(+e.target.value); setHour(now.getHours()); }}
-                style={{ width: '100%', accentColor: '#0d9488' }} />
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#475569', marginTop: 4 }}>
-                <span>Now</span><span>30 min</span><span>1 hour</span><span>2 hours</span>
-              </div>
-            </div>
-          )}
-        </div>
+        <TimePicker
+          show={showTimePicker}
+          onToggle={() => setShowTimePicker(!showTimePicker)}
+          minutesAway={minutesAway}
+          onMinutesChange={(val) => { setMinutesAway(val); setHour(now.getHours()); }}
+          hour={hour}
+        />
 
         {/* Find parking button */}
         <div style={{ padding: '12px 16px', borderBottom: '1px solid #1e3a52' }}>
@@ -467,7 +351,6 @@ export default function MapPage() {
             }}>
             {loading ? 'Predicting...' : !destination ? 'Enter a destination first' : showTimePicker ? `Find Parking (arriving in ${minutesAway} min)` : 'Find Parking Now'}
           </button>
-
           {error && (
             <div style={{ marginTop: 8, padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid #7f1d1d', borderRadius: 6, color: '#fca5a5', fontSize: 12 }}>
               {error}
@@ -482,226 +365,21 @@ export default function MapPage() {
               Search for a destination and tap Find Parking
             </div>
           )}
-
-          {blocks.length > 0 && (
-            <>
-              {routeInfo && selectedBlock && (
-                <div style={{ padding: '10px 16px', background: '#0f2a3a', borderBottom: '1px solid #1e3a52' }}>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 8 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#112031', borderRadius: 6, padding: '8px 12px' }}>
-                      <div style={{ fontSize: 16 }}>🚗</div>
-                      <div style={{ flex: 1, fontSize: 12, color: '#94a3b8' }}>
-                        Drive <span style={{ color: '#cbd5e1' }}>your location</span> → <span style={{ color: '#cbd5e1' }}>parking</span>
-                      </div>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: '#14b8a6' }}>
-                        {routeInfo.driveMin}<span style={{ fontSize: 10, fontWeight: 500, color: '#94a3b8' }}> min</span>
-                      </div>
-                    </div>
-                    {routeInfo.walkMin && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#112031', borderRadius: 6, padding: '8px 12px' }}>
-                        <div style={{ fontSize: 16 }}>🚶</div>
-                        <div style={{ flex: 1, fontSize: 12, color: '#94a3b8' }}>
-                          Walk <span style={{ color: '#cbd5e1' }}>parking</span> → <span style={{ color: '#cbd5e1' }}>destination</span>
-                        </div>
-                        <div style={{ fontSize: 14, fontWeight: 700, color: '#f8fafc' }}>
-                          {routeInfo.walkMin}<span style={{ fontSize: 10, fontWeight: 500, color: '#94a3b8' }}> min</span>
-                        </div>
-                      </div>
-                    )}
-                    {routeInfo.walkMin && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#0f1e2d', borderRadius: 6, padding: '8px 12px', border: '1px solid #1e3a52' }}>
-                        <div style={{ fontSize: 16 }}>⏱</div>
-                        <div style={{ flex: 1, fontSize: 12, color: '#94a3b8', fontWeight: 600 }}>
-                          Total trip
-                        </div>
-                        <div style={{ fontSize: 14, fontWeight: 700, color: '#f59e0b' }}>
-                          {routeInfo.driveMin + routeInfo.walkMin}<span style={{ fontSize: 10, fontWeight: 500, color: '#94a3b8' }}> min</span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  <button onClick={() => {
-                    const sorted = [...blocks].sort((a,b) => a.predicted_occupancy_pct - b.predicted_occupancy_pct);
-                    const nextIdx = (bestBlockIndex + 1) % sorted.length;
-                    setBestBlockIndex(nextIdx);
-                    const next = sorted[nextIdx];
-                    setSelectedBlock(next);
-                    drawBlockRoutes(next);
-                  }} style={{ width: '100%', padding: '7px', borderRadius: 6, border: '1px solid #1e3a52', background: 'transparent', color: '#64748b', fontSize: 11, cursor: 'pointer' }}>
-                    Try next best option →
-                  </button>
-                </div>
-              )}
-              {selectedBlock ? (
-                <button onClick={() => {
-                  setSelectedBlock(null);
-                  if (driveRouteRef.current) driveRouteRef.current.remove();
-                  if (walkRouteRef.current) walkRouteRef.current.remove();
-                  setRouteInfo(null);
-                  setDriveSteps([]);
-                }}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 8,
-                    width: '100%', padding: '10px 16px', background: '#0a1520',
-                    border: 'none', borderBottom: '1px solid #1e3a52',
-                    color: '#94a3b8', fontSize: 12, fontWeight: 600,
-                    cursor: 'pointer', textAlign: 'left',
-                  }}>
-                  ← Back to all {blocks.length} blocks
-                </button>
-              ) : (
-                <div style={{ padding: '8px 16px', fontSize: 10, color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em', background: '#0a1520', borderBottom: '1px solid #1e3a52' }}>
-                  {blocks.length} blocks nearby · tap to see routes
-                </div>
-              )}
-              {(selectedBlock ? blocks.filter(b => b.lat === selectedBlock.lat && b.lon === selectedBlock.lon) : blocks).map(b => (
-                <div key={`${b.lat},${b.lon}`}
-                  onClick={() => {
-                    const isSelected = selectedBlock?.lat === b.lat && selectedBlock?.lon === b.lon;
-                    setSelectedBlock(isSelected ? null : b);
-                    if (!isSelected) drawBlockRoutes(b);
-                    else {
-                      if (driveRouteRef.current) driveRouteRef.current.remove();
-                      if (walkRouteRef.current) walkRouteRef.current.remove();
-                      setRouteInfo(null);
-                    }
-                  }}
-                  style={{
-                    padding: '10px 16px', borderBottom: '1px solid #0f1e2d', cursor: 'pointer',
-                    background: selectedBlock?.lat === b.lat && selectedBlock?.lon === b.lon ? '#112031' : 'transparent',
-                  }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <div style={{
-                      width: 40, height: 40, borderRadius: 8, background: b.color,
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      fontWeight: 800, fontSize: 13, flexShrink: 0,
-                    }}>
-                      {Math.round(b.predicted_occupancy_pct)}%
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: 'white', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{b.street}</div>
-                      <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
-                        {(b.distance_meters / 1609.344).toFixed(2)} mi away
-                      </div>
-                    </div>
-                    <div style={{ fontSize: 10, padding: '3px 7px', borderRadius: 4, background: demandBg[b.demand_level] || '#1e3a52', color: b.color, fontWeight: 600, flexShrink: 0 }}>
-                      {b.demand_level}
-                    </div>
-                  </div>
-
-                  {selectedBlock?.lat === b.lat && selectedBlock?.lon === b.lon && (
-                    <div style={{ marginTop: 8, padding: '8px 10px', background: '#0d1b2a', borderRadius: 6, fontSize: 12 }}>
-                      <div style={{ color: '#94a3b8', lineHeight: 1.5, marginBottom: 10 }}>
-                        {b.predicted_occupancy_pct >= 85 && '🔴 Very hard to park — consider public transit or a nearby garage.'}
-                        {b.predicted_occupancy_pct >= 70 && b.predicted_occupancy_pct < 85 && '🟠 Limited spots — arrive early or check nearby blocks.'}
-                        {b.predicted_occupancy_pct >= 40 && b.predicted_occupancy_pct < 70 && '🟡 Decent chance of finding parking. Circle the block if needed.'}
-                        {b.predicted_occupancy_pct < 40 && '🟢 Plenty of spaces — easy parking here!'}
-                      </div>
-
-                        {driveSteps.length > 0 && (() => {
-                          const ManeuverIcon = ({ type, modifier, isArrive }) => {
-                            const stroke = isArrive ? 'white' : '#14b8a6';
-                            const common = { width: 22, height: 22, viewBox: '0 0 24 24', fill: 'none', stroke, strokeWidth: 2.4, strokeLinecap: 'round', strokeLinejoin: 'round' };
-                            if (isArrive) return (<svg {...common}><circle cx="12" cy="10" r="4" fill="white"/><path d="M12 14v8" stroke="white"/></svg>);
-                            if (type === 'depart') return (<svg {...common}><path d="M12 20V6"/><path d="M5 13l7-7 7 7"/></svg>);
-                            if (type === 'roundabout') return (<svg {...common}><circle cx="12" cy="12" r="5"/><path d="M12 22v-5"/></svg>);
-                            switch (modifier) {
-                              case 'right':       return (<svg {...common}><path d="M5 19V11a4 4 0 0 1 4-4h10"/><path d="M14 2l5 5-5 5"/></svg>);
-                              case 'left':        return (<svg {...common}><path d="M19 19V11a4 4 0 0 0-4-4H5"/><path d="M10 2L5 7l5 5"/></svg>);
-                              case 'sharp right': return (<svg {...common}><path d="M6 21V13a3 3 0 0 1 3-3h11"/><path d="M15 5l5 5-5 5"/></svg>);
-                              case 'sharp left':  return (<svg {...common}><path d="M18 21V13a3 3 0 0 0-3-3H4"/><path d="M9 5l-5 5 5 5"/></svg>);
-                              case 'slight right':return (<svg {...common}><path d="M7 22V11c0-3 2-5 5-5h6"/><path d="M14 2l5 4-5 4"/></svg>);
-                              case 'slight left': return (<svg {...common}><path d="M17 22V11c0-3-2-5-5-5H6"/><path d="M10 2L5 6l5 4"/></svg>);
-                              case 'uturn':       return (<svg {...common}><path d="M5 21v-9a5 5 0 0 1 10 0v6"/><path d="M19 16l-4 4-4-4"/></svg>);
-                              case 'straight':    return (<svg {...common}><path d="M12 22V4"/><path d="M5 11l7-7 7 7"/></svg>);
-                              default:            return (<svg {...common}><circle cx="12" cy="12" r="2.5" fill={stroke}/></svg>);
-                            }
-                          };
-                          return (
-                            <div style={{
-                              marginBottom: 12,
-                              background: '#0a1422',
-                              borderRadius: 10,
-                              border: '1px solid #1e293b',
-                              overflow: 'hidden',
-                            }}>
-                              <div style={{
-                                padding: '12px 14px',
-                                borderBottom: '1px solid #1e293b',
-                                display: 'flex', alignItems: 'baseline', gap: 8,
-                              }}>
-                                <div style={{ fontSize: 18, fontWeight: 700, color: '#f8fafc' }}>
-                                  {routeInfo?.driveMin}<span style={{ fontSize: 12, fontWeight: 500, color: '#94a3b8' }}> min</span>
-                                </div>
-                                <div style={{ color: '#475569', fontSize: 11 }}>·</div>
-                                <div style={{ fontSize: 13, color: '#94a3b8' }}>
-                                  {routeInfo?.driveMi != null ? `${routeInfo.driveMi.toFixed(1)} mi` : ''}
-                                </div>
-                                <div style={{ marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: '#64748b', letterSpacing: 1.2 }}>
-                                  DRIVE
-                                </div>
-                              </div>
-                              <div style={{ maxHeight: 240, overflowY: 'auto' }}>
-                                {driveSteps.map((s, i) => {
-                                  const m = s.maneuver || {};
-                                  const isArrive = m.type === 'arrive';
-                                  const isDepart = m.type === 'depart';
-                                  const street = s.name || s.ref || '';
-                                  let verb, target;
-                                  if (isDepart) { verb = 'Head'; target = street ? `onto ${street}` : ''; }
-                                  else if (isArrive) { verb = 'Arrive at'; target = street || 'destination'; }
-                                  else if (m.type === 'roundabout') { verb = 'Take the roundabout'; target = street ? `to ${street}` : ''; }
-                                  else if (m.modifier) { verb = `Turn ${m.modifier}`; target = street ? `onto ${street}` : ''; }
-                                  else { verb = 'Continue'; target = street ? `on ${street}` : ''; }
-                                  const distMi = s.distance / 1609.344;
-                                  const dist = distMi < 0.1 ? `${distMi.toFixed(2)} mi` : `${distMi.toFixed(1)} mi`;
-                                  return (
-                                    <div key={i} style={{
-                                      display: 'flex', alignItems: 'center', gap: 12,
-                                      padding: '12px 14px',
-                                      borderTop: i === 0 ? 'none' : '1px solid #122033',
-                                    }}>
-                                      <div style={{
-                                        width: 36, height: 36, borderRadius: 999,
-                                        background: isArrive ? '#0d9488' : '#0f2031',
-                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                        flexShrink: 0,
-                                      }}>
-                                        <ManeuverIcon type={m.type} modifier={m.modifier} isArrive={isArrive} />
-                                      </div>
-                                      <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{
-                                          fontSize: 13, lineHeight: 1.35, color: '#f1f5f9',
-                                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                                        }}>
-                                          <span style={{ fontWeight: 700 }}>{verb}</span>
-                                          {target && <span style={{ color: '#cbd5e1', fontWeight: 500 }}> {target}</span>}
-                                        </div>
-                                        {!isArrive && (
-                                          <div style={{ fontSize: 11.5, color: '#64748b', marginTop: 2 }}>{dist}</div>
-                                        )}
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          );
-                        })()}
-                      </div>
-                    )}
-                </div>
-              ))}
-            </>
-          )}
+          <BlockList
+            blocks={blocks}
+            selectedBlock={selectedBlock}
+            onSelectBlock={handleSelectBlock}
+            routeInfo={routeInfo}
+            driveSteps={driveSteps}
+            onNextBest={handleNextBest}
+            onBack={handleBack}
+          />
         </div>
       </div>
 
-      {/* ── Map ── */}
+      {/* Map */}
       <div style={{ flex: 1, position: 'relative' }}>
         <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
-
-        {/* Loading overlay */}
         {loading && (
           <div style={{ position: 'absolute', inset: 0, background: 'rgba(10,21,32,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999 }}>
             <div style={{ background: '#112031', border: '1px solid #1e3a52', borderRadius: 10, padding: '20px 32px', textAlign: 'center' }}>

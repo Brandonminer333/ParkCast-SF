@@ -183,25 +183,26 @@ NEIGHBORHOOD_COORDS = {
     "unknown":    (37.7749, -122.4194),
 }
 
+# Keyword → neighborhood mapping (first match wins).
+_BLOCK_KEYWORDS: dict[str, list[str]] = {
+    "mission":    ["mission", "valencia", "guerrero", "24th", "16th"],
+    "soma":       ["folsom", "howard", "brannan", "soma", "3rd", "4th", "5th"],
+    "castro":     ["castro", "18th", "19th", "market"],
+    "marina":     ["chestnut", "lombard", "marina", "union"],
+    "tenderloin": ["turk", "ellis", "eddy", "tenderloin", "leavenworth"],
+    "haight":     ["haight", "ashbury", "masonic"],
+    "richmond":   ["clement", "geary", "richmond", "balboa"],
+}
+
+
 def map_block_to_neighborhood(block_name):
-    """Map a street block name to SF neighborhood."""
+    """Map a street block name to SF neighborhood via keyword lookup."""
     if not block_name:
         return "unknown"
     b = str(block_name).lower()
-    if any(x in b for x in ["mission", "valencia", "guerrero", "24th", "16th"]):
-        return "mission"
-    if any(x in b for x in ["folsom", "howard", "brannan", "soma", "3rd", "4th", "5th"]):
-        return "soma"
-    if any(x in b for x in ["castro", "18th", "19th", "market"]):
-        return "castro"
-    if any(x in b for x in ["chestnut", "lombard", "marina", "union"]):
-        return "marina"
-    if any(x in b for x in ["turk", "ellis", "eddy", "tenderloin", "leavenworth"]):
-        return "tenderloin"
-    if any(x in b for x in ["haight", "ashbury", "masonic"]):
-        return "haight"
-    if any(x in b for x in ["clement", "geary", "richmond", "balboa"]):
-        return "richmond"
+    for neighborhood, keywords in _BLOCK_KEYWORDS.items():
+        if any(kw in b for kw in keywords):
+            return neighborhood
     return "unknown"
 
 

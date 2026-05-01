@@ -20,172 +20,43 @@ Endpoints:
   GET  /geocode_proxy   → Nominatim address lookup
 """
 
-import json
 import logging
-import math
-import os
 from typing import List, Optional
 
-import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+
+from app.bundle import LOCAL_MODEL_DIR, ModelBundle, resolve_model_dir
+from app.constants import (
+    MAX_BLOCKS_RETURNED,
+    classify_occupancy,
+    color_for,
+    demand_level,
+    recommendation_for,
+)
+from app.features import build_features, haversine_vec, predict_rows
+from app.schemas import (
+    BlockPrediction,
+    BlocksRequest,
+    BlocksResponse,
+    ParkingInput,
+    ParkingPrediction,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── Backward-compatible aliases for test imports ───────────────────
+_demand_level = demand_level
+_color = color_for
+_recommendation = recommendation_for
 
-# ── Artifact location ──────────────────────────────────────────────
-GCS_BUCKET = os.getenv("GCS_BUCKET", "").strip()
-GCS_PREFIX = os.getenv("GCS_PREFIX", "").strip()
-if GCS_PREFIX and not GCS_PREFIX.endswith("/"):
-    GCS_PREFIX += "/"
-
-LOCAL_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-CACHE_DIR = os.getenv("PARKCAST_CACHE_DIR", "/tmp/parkcast_models")
-
-ARTIFACT_FILES = [
-    "LightGBM.pkl",
-    "LightGBM.block_aggs.parquet",
-    "LightGBM.meta.json",
-    "blocks.parquet",
-    "lag_history.parquet",
-    "citations_hourly_median.parquet",
-    "sfpark_calibration.parquet",
-    "block_static_features.parquet",
-]
-
-# Optional: enriches blocks with corridor/limits (street name + cross-streets)
-# and provides per-cnn (hour, dow) fallback baselines for inferred (non-metered)
-# blocks — distance-weighted KNN over the K=5 nearest metered blocks. Missing
-# in GCS won't break the service.
-OPTIONAL_ARTIFACT_FILES = [
-    "master_blocks.parquet",
-    "inferred_block_aggs.parquet",
-]
-
-# Cap on rows returned by /predict/blocks. The served universe is now
-# citywide (~12.7k blockfaces), so a 2km radius can match thousands; the
-# frontend map gets unusable above a few hundred markers.
-MAX_BLOCKS_RETURNED = 200
-
-
-def _download_from_gcs(bucket: str, prefix: str, files: List[str], dest: str, optional: bool = False) -> None:
-    from google.cloud import storage  # lazy — local dev doesn't need it
-
-    os.makedirs(dest, exist_ok=True)
-    client = storage.Client()
-    b = client.bucket(bucket)
-    for f in files:
-        key = f"{prefix}{f}"
-        try:
-            b.blob(key).download_to_filename(os.path.join(dest, f))
-            logger.info(f"  downloaded gs://{bucket}/{key}")
-        except Exception as e:
-            if optional:
-                logger.info(f"  skipped optional gs://{bucket}/{key}: {e}")
-            else:
-                raise
-
-
-def _resolve_model_dir() -> str:
-    if GCS_BUCKET:
-        try:
-            logger.info(f"Fetching artifacts from gs://{GCS_BUCKET}/{GCS_PREFIX} …")
-            _download_from_gcs(GCS_BUCKET, GCS_PREFIX, ARTIFACT_FILES, CACHE_DIR)
-            _download_from_gcs(GCS_BUCKET, GCS_PREFIX, OPTIONAL_ARTIFACT_FILES, CACHE_DIR, optional=True)
-            return CACHE_DIR
-        except Exception as e:  # noqa: BLE001 — any download error → fallback
-            logger.warning(f"GCS download failed ({e}); falling back to {LOCAL_MODEL_DIR}")
-    else:
-        logger.info(f"GCS_BUCKET unset; loading from {LOCAL_MODEL_DIR}")
-    return LOCAL_MODEL_DIR
-
-
-# ── Model bundle ───────────────────────────────────────────────────
-class ModelBundle:
-    """Model + every lookup parquet inference needs, loaded once at startup."""
-
-    def __init__(self, src: str):
-        self.src = src
-
-        self.model = joblib.load(os.path.join(src, "LightGBM.pkl"))
-        with open(os.path.join(src, "LightGBM.meta.json")) as f:
-            self.meta = json.load(f)
-        self.features: List[str] = self.meta["features"]
-        self.global_mean: float = float(self.meta.get("global_mean", 45.0))
-
-        self.blocks = pd.read_parquet(os.path.join(src, "blocks.parquet"))
-        self.block_aggs = pd.read_parquet(os.path.join(src, "LightGBM.block_aggs.parquet"))
-        self.static = pd.read_parquet(os.path.join(src, "block_static_features.parquet"))
-        self.cit_med = pd.read_parquet(os.path.join(src, "citations_hourly_median.parquet"))
-
-        # Per-cnn (hour, dow) baselines for inferred blocks — distance-weighted
-        # KNN over the K=5 nearest metered blocks (built in
-        # dev/build_full_blocks.ipynb). Each inferred block's baseline reflects
-        # the local metered behavior, not a flat neighborhood average.
-        # Optional: older bundles without this file degrade to global_mean.
-        inferred_path = os.path.join(src, "inferred_block_aggs.parquet")
-        self.inferred_aggs: Optional[pd.DataFrame] = (
-            pd.read_parquet(inferred_path) if os.path.exists(inferred_path) else None
-        )
-
-        # `coverage` was added when blocks.parquet went citywide. Older
-        # metered-only bundles don't have it; default everything to "metered"
-        # so existing clients keep working.
-        if "coverage" not in self.blocks.columns:
-            self.blocks["coverage"] = "metered"
-
-        # Street label enrichment: cnn-keyed merge against master_blocks.
-        # build_full_blocks.ipynb populates `cnn` on every block (including
-        # metered ones via spatial-join), so an exact key merge replaces the
-        # older KDTree-with-tolerance fallback that missed ~1.3% of long
-        # downtown blocks. Blocks that fail the join (no real street name)
-        # are *dropped* from the served catalog so the API never returns a
-        # null or "Unknown" street label to the frontend.
-        self.blocks["street"] = None
-        master_path = os.path.join(src, "master_blocks.parquet")
-        if os.path.exists(master_path) and "cnn" in self.blocks.columns:
-            try:
-                master = pd.read_parquet(master_path)[["cnn", "corridor", "limits"]].dropna(subset=["cnn"])
-                master["cnn"] = master["cnn"].astype("Int64")
-                blocks_cnn = self.blocks["cnn"].astype("Int64")
-                lookup = master.set_index("cnn")
-                corridors = blocks_cnn.map(lookup["corridor"])
-                limits_s = blocks_cnn.map(lookup["limits"])
-
-                def _street(c, lim):
-                    if pd.notna(c) and pd.notna(lim):
-                        return f"{c} ({lim})"
-                    if pd.notna(c):
-                        return str(c)
-                    return None
-
-                self.blocks["street"] = [_street(c, lim) for c, lim in zip(corridors, limits_s)]
-            except Exception as e:
-                logger.warning(f"master_blocks.parquet unreadable ({e}); all blocks will be dropped")
-
-        before = len(self.blocks)
-        self.blocks = self.blocks[self.blocks["street"].notna()].reset_index(drop=True)
-        dropped = before - len(self.blocks)
-        logger.info(
-            f"  street enrichment: kept {len(self.blocks):,}/{before:,} blocks, "
-            f"dropped {dropped} without a real street label"
-        )
-
-        # Freeze the neighborhood category set to what training saw.
-        # Unknown categories at inference become NaN → surrogate splits.
-        neighborhoods = sorted(self.blocks["neighborhood"].dropna().unique().tolist())
-        self.neighborhood_dtype = pd.CategoricalDtype(categories=neighborhoods)
-
-        logger.info(f"ModelBundle loaded from {src}: " f"{len(self.blocks):,} blocks · {len(self.features)} features")
-
-
+# ── Model bundle (loaded once at import time) ──────────────────────
 BUNDLE: Optional[ModelBundle] = None
 try:
-    BUNDLE = ModelBundle(_resolve_model_dir())
+    BUNDLE = ModelBundle(resolve_model_dir())
 except Exception as e:  # noqa: BLE001
     logger.error(f"❌ Failed to load ModelBundle: {e}")
 
@@ -203,205 +74,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# ── Pydantic models ────────────────────────────────────────────────
-class BlocksRequest(BaseModel):
-    lat: float = Field(..., description="Destination latitude")
-    lon: float = Field(..., description="Destination longitude")
-    radius_meters: int = Field(500, ge=100, le=2000)
-    hour: int = Field(..., ge=0, le=23)
-    day_of_week: int = Field(..., ge=0, le=6)
-    month: int = Field(..., ge=1, le=12)
-    is_raining: int = Field(0, ge=0, le=1)
-    is_holiday: int = Field(0, ge=0, le=1)
-    is_school_day: int = Field(1, ge=0, le=1)
-    temperature: float = Field(60.0)
-    event_intensity: float = Field(0.0, ge=0.0, le=1.0)
-    minutes_away: int = Field(0, ge=0, le=120)
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "lat": 37.7816,
-                "lon": -122.3975,
-                "radius_meters": 500,
-                "hour": 19,
-                "day_of_week": 4,
-                "month": 4,
-                "is_raining": 0,
-                "is_holiday": 0,
-                "is_school_day": 1,
-                "temperature": 62.5,
-                "event_intensity": 0.6,
-                "minutes_away": 20,
-            }
-        }
-
-
-class BlockPrediction(BaseModel):
-    lat: float
-    lon: float
-    street: Optional[str] = None
-    neighborhood: Optional[str] = None
-    total_spaces: int
-    distance_meters: int
-    predicted_occupancy_pct: float
-    available_spaces_estimate: int
-    demand_level: str
-    color: str
-    # "metered"  — block has SFpark training labels, prediction is direct
-    # "inferred" — non-metered blockface, prediction via neighborhood baseline
-    coverage: str = "metered"
-
-
-class BlocksResponse(BaseModel):
-    destination_lat: float
-    destination_lon: float
-    radius_meters: int
-    predicted_at_hour: int
-    minutes_away: int
-    total_blocks_found: int
-    blocks: List[BlockPrediction]
-
-
-class ParkingInput(BaseModel):
-    """Aggregate neighborhood-level prediction (backward-compat with v2)."""
-
-    hour: int = Field(..., ge=0, le=23)
-    day_of_week: int = Field(..., ge=0, le=6)
-    month: int = Field(..., ge=1, le=12)
-    neighborhood: str = Field(...)
-    total_spaces: int = Field(40, ge=1)
-    is_raining: int = Field(0, ge=0, le=1)
-    is_holiday: int = Field(0, ge=0, le=1)
-    is_school_day: int = Field(1, ge=0, le=1)
-    temperature: float = Field(60.0)
-    event_intensity: float = Field(0.0, ge=0.0, le=1.0)
-
-
-class ParkingPrediction(BaseModel):
-    neighborhood: str
-    hour: int
-    day_of_week: int
-    predicted_occupancy_pct: float
-    available_spaces_estimate: int
-    demand_level: str
-    recommendation: str
-    blocks_aggregated: int
-
-    class Config:
-        protected_namespaces = ()
-
-
-# ── Helpers ────────────────────────────────────────────────────────
-def _haversine_vec(lat0: float, lon0: float, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
-    R = 6_371_000
-    phi0 = math.radians(lat0)
-    phi1 = np.radians(lats)
-    dphi = np.radians(lats - lat0)
-    dlam = np.radians(lons - lon0)
-    a = np.sin(dphi / 2) ** 2 + math.cos(phi0) * np.cos(phi1) * np.sin(dlam / 2) ** 2
-    return R * 2 * np.arcsin(np.sqrt(a))
-
-
-def _demand_level(pct: float) -> str:
-    if pct < 40:
-        return "Low"
-    if pct < 70:
-        return "Medium"
-    if pct < 85:
-        return "High"
-    return "Very High"
-
-
-def _color(pct: float) -> str:
-    if pct < 40:
-        return "#22c55e"  # green
-    if pct < 70:
-        return "#f59e0b"  # amber
-    if pct < 85:
-        return "#f97316"  # orange
-    return "#ef4444"  # red
-
-
-def _recommendation(pct: float) -> str:
-    if pct < 40:
-        return "Easy to park — plenty of spaces."
-    if pct < 70:
-        return "Good chance of parking — head over."
-    if pct < 85:
-        return "Limited spots — arrive early or check nearby blocks."
-    return "Very hard to park — consider transit or a garage."
-
-
-LAG_COLS = ["lag_1d", "lag_2d", "lag_7d", "lag_14d", "lag_28d", "lag_3d_mean", "lag_7d_mean"]
-
-
-def _build_features(
-    blocks_df: pd.DataFrame,
-    target_hour: int,
-    req: BlocksRequest,
-    bundle: ModelBundle,
-) -> pd.DataFrame:
-    """Attach every feature LightGBM needs to each block row.
-
-    Returns a DataFrame with all `bundle.features` columns plus a `_baseline`
-    column (block_hour_dow_mean with fallbacks) used to reconstruct the
-    non-residual prediction.
-    """
-    df = blocks_df.copy()
-
-    df["hour"] = target_hour
-    df["day_of_week"] = req.day_of_week
-    df["month"] = req.month
-    df["is_weekend"] = 1 if req.day_of_week >= 5 else 0
-    df["is_holiday"] = req.is_holiday
-    df["is_school_day"] = req.is_school_day
-    df["is_raining"] = req.is_raining
-    df["temperature"] = req.temperature
-    df["event_intensity"] = req.event_intensity
-
-    df = df.merge(bundle.block_aggs, on=["lat", "lon", "hour", "day_of_week"], how="left")
-    df = df.merge(bundle.static, on=["lat", "lon"], how="left")
-    df = df.merge(bundle.cit_med, on=["hour", "day_of_week"], how="left")
-
-    # Inferred (non-metered) blocks miss the per-(lat, lon) join above. Fill
-    # the resulting NaNs with this block's KNN-derived per-(cnn, hour, dow)
-    # baseline (distance-weighted average of the K=5 nearest metered blocks)
-    # before the global-mean fallback. cnn is populated only on inferred rows
-    # so this is effectively a left-join scoped to that subset.
-    if bundle.inferred_aggs is not None and "cnn" in df.columns:
-        infa = bundle.inferred_aggs.rename(
-            columns={
-                "block_hour_dow_mean": "_inf_bhd",
-                "block_hour_mean": "_inf_bh",
-                "block_mean": "_inf_bm",
-            }
-        )
-        df = df.merge(infa, on=["cnn", "hour", "day_of_week"], how="left")
-        df["block_hour_dow_mean"] = df["block_hour_dow_mean"].fillna(df["_inf_bhd"])
-        df["block_hour_mean"] = df["block_hour_mean"].fillna(df["_inf_bh"])
-        df["block_mean"] = df["block_mean"].fillna(df["_inf_bm"])
-        df = df.drop(columns=["_inf_bhd", "_inf_bh", "_inf_bm"])
-
-    # Lags stay NaN: lag_history ends at the training split and no live feed
-    # is wired yet. LightGBM uses surrogate splits for missing features.
-    for col in LAG_COLS:
-        df[col] = np.nan
-
-    df["neighborhood"] = df["neighborhood"].astype(bundle.neighborhood_dtype)
-
-    df["_baseline"] = (
-        df["block_hour_dow_mean"].fillna(df["block_hour_mean"]).fillna(df["block_mean"]).fillna(bundle.global_mean)
-    )
-    return df
-
-
-def _predict_rows(df: pd.DataFrame, bundle: ModelBundle) -> np.ndarray:
-    X = df[bundle.features]
-    residual = bundle.model.predict(X)
-    return np.clip(df["_baseline"].values + residual, 0.0, 100.0)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────
@@ -445,42 +117,20 @@ def predict_blocks(req: BlocksRequest):
     target_hour = (req.hour + req.minutes_away // 60) % 24
 
     blocks = BUNDLE.blocks.copy()
-    blocks["distance_m"] = _haversine_vec(req.lat, req.lon, blocks["lat"].to_numpy(), blocks["lon"].to_numpy())
+    blocks["distance_m"] = haversine_vec(req.lat, req.lon, blocks["lat"].to_numpy(), blocks["lon"].to_numpy())
 
     nearby = blocks[blocks["distance_m"] <= req.radius_meters].sort_values("distance_m")
     if nearby.empty:
-        # Nothing in radius → snap to the 8 closest trained blocks so the user
-        # still gets a usable answer.
+        # Nothing in radius → snap to the 8 closest trained blocks so the
+        # user still gets a usable answer.
         nearby = blocks.sort_values("distance_m").head(8)
 
-    # Cap the result list — the citywide universe makes it possible to match
-    # thousands of blocks within a 2km radius downtown.
     nearby = nearby.head(MAX_BLOCKS_RETURNED)
 
-    feat_df = _build_features(nearby, target_hour, req, BUNDLE)
-    preds = _predict_rows(feat_df, BUNDLE)
+    feat_df = build_features(nearby, target_hour, req, BUNDLE)
+    preds = predict_rows(feat_df, BUNDLE)
 
-    out: List[BlockPrediction] = []
-    for (_, row), pct in zip(feat_df.iterrows(), preds):
-        pct = float(round(pct, 2))
-        total = int(row["total_spaces"]) if pd.notna(row["total_spaces"]) else 0
-        avail = int(total * (1 - pct / 100))
-        neigh = row["neighborhood"]
-        out.append(
-            BlockPrediction(
-                lat=float(row["lat"]),
-                lon=float(row["lon"]),
-                street=str(row["street"]) if "street" in row and pd.notna(row.get("street")) else None,
-                neighborhood=str(neigh) if pd.notna(neigh) else None,
-                total_spaces=total,
-                distance_meters=int(row["distance_m"]),
-                predicted_occupancy_pct=pct,
-                available_spaces_estimate=avail,
-                demand_level=_demand_level(pct),
-                color=_color(pct),
-                coverage=str(row["coverage"]) if "coverage" in row and pd.notna(row.get("coverage")) else "metered",
-            )
-        )
+    out = _build_block_predictions(feat_df, preds)
 
     return BlocksResponse(
         destination_lat=req.lat,
@@ -491,6 +141,40 @@ def predict_blocks(req: BlocksRequest):
         total_blocks_found=len(out),
         blocks=out,
     )
+
+
+def _build_block_predictions(
+    feat_df: pd.DataFrame, preds: np.ndarray,
+) -> List[BlockPrediction]:
+    """Vectorized construction of BlockPrediction list from feature df + preds."""
+    result_df = feat_df[["lat", "lon", "street", "neighborhood", "total_spaces", "distance_m", "coverage"]].copy()
+    result_df["predicted_occupancy_pct"] = np.round(preds, 2)
+    result_df["total_spaces"] = result_df["total_spaces"].fillna(0).astype(int)
+    result_df["available_spaces_estimate"] = (
+        result_df["total_spaces"] * (1 - result_df["predicted_occupancy_pct"] / 100)
+    ).astype(int)
+
+    out: List[BlockPrediction] = []
+    for row in result_df.itertuples(index=False):
+        pct = float(row.predicted_occupancy_pct)
+        info = classify_occupancy(pct)
+        neigh = row.neighborhood
+        out.append(
+            BlockPrediction(
+                lat=float(row.lat),
+                lon=float(row.lon),
+                street=str(row.street) if pd.notna(row.street) else None,
+                neighborhood=str(neigh) if pd.notna(neigh) else None,
+                total_spaces=int(row.total_spaces),
+                distance_meters=int(row.distance_m),
+                predicted_occupancy_pct=pct,
+                available_spaces_estimate=int(row.available_spaces_estimate),
+                demand_level=info.label,
+                color=info.color,
+                coverage=str(row.coverage) if pd.notna(row.coverage) else "metered",
+            )
+        )
+    return out
 
 
 @app.post("/predict", response_model=ParkingPrediction)
@@ -522,10 +206,11 @@ def predict(body: ParkingInput):
         minutes_away=0,
     )
     neigh_blocks["distance_m"] = 0.0
-    feat_df = _build_features(neigh_blocks, body.hour, synthetic_req, BUNDLE)
-    preds = _predict_rows(feat_df, BUNDLE)
+    feat_df = build_features(neigh_blocks, body.hour, synthetic_req, BUNDLE)
+    preds = predict_rows(feat_df, BUNDLE)
     pct = float(round(float(np.median(preds)), 2))
     avail = int(body.total_spaces * (1 - pct / 100))
+    info = classify_occupancy(pct)
 
     return ParkingPrediction(
         neighborhood=body.neighborhood,
@@ -533,8 +218,8 @@ def predict(body: ParkingInput):
         day_of_week=body.day_of_week,
         predicted_occupancy_pct=pct,
         available_spaces_estimate=avail,
-        demand_level=_demand_level(pct),
-        recommendation=_recommendation(pct),
+        demand_level=info.label,
+        recommendation=info.recommendation,
         blocks_aggregated=int(len(neigh_blocks)),
     )
 

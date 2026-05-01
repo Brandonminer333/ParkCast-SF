@@ -3,15 +3,14 @@
 A real `uvicorn` server is launched in a background thread on a free localhost
 port, and each test hits the live HTTP endpoint through `httpx`. This is the
 closest we can get to a production smoke test without actually deploying:
-real ASGI server, real HTTP socket, real lifespan, real model, real parquet.
+real ASGI server, real HTTP socket, real ModelBundle.
 
-The whole module is skipped when the trained model isn't available on disk.
+The whole module is skipped when the ModelBundle isn't available on disk.
 """
 
 from __future__ import annotations
 
 import contextlib
-import os
 import pathlib
 import socket
 import sys
@@ -26,19 +25,17 @@ _repo_root = pathlib.Path(__file__).resolve().parents[1]
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
-from app.main import MODEL_PATH  # noqa: E402
+import app.main as main_mod  # noqa: E402
 
-_MODEL_AVAILABLE = bool(os.environ.get("MLFLOW_TRACKING_URI", "").strip()) or os.path.exists(
-    MODEL_PATH
-)
+_BUNDLE_AVAILABLE = main_mod.BUNDLE is not None
 
 pytestmark = [
     pytest.mark.application,
     pytest.mark.skipif(
-        not _MODEL_AVAILABLE,
+        not _BUNDLE_AVAILABLE,
         reason=(
-            "No model source available. Set MLFLOW_TRACKING_URI to load the "
-            f"champion from the registry, or place a legacy model at {MODEL_PATH}."
+            "ModelBundle not loaded. Ensure model artifacts exist in "
+            f"{main_mod.LOCAL_MODEL_DIR} or set GCS_BUCKET."
         ),
     ),
 ]
@@ -87,12 +84,12 @@ def live_server():
         thread.join(timeout=5)
 
 
-def test_server_root_returns_welcome(live_server):
+def test_server_root_returns_service_info(live_server):
     resp = httpx.get(f"{live_server}/", timeout=5.0)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["message"].startswith("Welcome to ParkCast SF API")
-    assert "predict_blocks" in body["endpoints"]
+    assert body["name"] == "ParkCast SF API"
+    assert "POST /predict/blocks" in body["endpoints"]
 
 
 def test_server_health_is_healthy(live_server):
@@ -100,7 +97,7 @@ def test_server_health_is_healthy(live_server):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "healthy"
-    assert body["model_loaded"] is True
+    assert body["total_blocks"] > 0
 
 
 def test_server_predict_blocks_roundtrip(live_server):
@@ -112,7 +109,7 @@ def test_server_predict_blocks_roundtrip(live_server):
         "day_of_week": 2,
         "month": 4,
         "is_raining": 0,
-        "has_nearby_event": 0,
+        "event_intensity": 0.0,
         "is_holiday": 0,
         "is_school_day": 1,
         "temperature": 62.0,
@@ -143,4 +140,6 @@ def test_server_cors_headers_present(live_server):
         timeout=5.0,
     )
     assert resp.status_code in (200, 204)
-    assert resp.headers.get("access-control-allow-origin") == "*"
+    # Starlette may reflect the request Origin or use literal "*"
+    acao = resp.headers.get("access-control-allow-origin")
+    assert acao in ("*", "https://example.com")
