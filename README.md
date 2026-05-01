@@ -6,10 +6,13 @@ ParkCast SF is a machine learning web service that predicts parking occupancy ah
 
 ---
 
+# Demo
+
 <video width="1280" height="960" controls>
   <source src="docs/demo-video.mov" type="video/mp4">
 </video>
 
+---
 ## Project Structure
 
 ```
