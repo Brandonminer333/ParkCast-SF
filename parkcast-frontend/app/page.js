@@ -151,7 +151,7 @@ export default function MapPage() {
             <span style="color:#888;font-size:11px">${(block.distance_meters / 1609.344).toFixed(2)} mi from destination</span>
           </div>
         `);
-      marker.on('click', () => setSelectedBlock(block));
+      marker.on('click', () => { setSelectedBlock(block); drawBlockRoutes(block); });
       markersRef.current.push(marker);
     });
   }, [blocks, leafletLoaded]);
