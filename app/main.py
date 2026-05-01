@@ -381,7 +381,7 @@ def health():
         raise HTTPException(status_code=503, detail="Model not loaded")
     metrics = BUNDLE.meta.get("metrics", {})
     return {
-        "status": "healthy",
+        "status": "healthy", "version": "v2-canary",
         "artifact_source": BUNDLE.src,
         "model_features": len(BUNDLE.features),
         "total_blocks": int(len(BUNDLE.blocks)),
