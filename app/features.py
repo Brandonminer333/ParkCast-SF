@@ -17,7 +17,10 @@ from app.schemas import BlocksRequest
 
 
 def haversine_vec(
-    lat0: float, lon0: float, lats: np.ndarray, lons: np.ndarray,
+    lat0: float,
+    lon0: float,
+    lats: np.ndarray,
+    lons: np.ndarray,
 ) -> np.ndarray:
     """Vectorized haversine distance in meters from a single point to arrays."""
     R = 6_371_000

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-
 # ── Occupancy thresholds ───────────────────────────────────────────
 THRESHOLD_LOW = 40
 THRESHOLD_MEDIUM = 70
@@ -26,8 +25,14 @@ class DemandInfo(NamedTuple):
 _BANDS: list[tuple[float, DemandInfo]] = [
     (THRESHOLD_LOW, DemandInfo("Low", "#22c55e", "Easy to park — plenty of spaces.")),
     (THRESHOLD_MEDIUM, DemandInfo("Medium", "#f59e0b", "Good chance of parking — head over.")),
-    (THRESHOLD_HIGH, DemandInfo("High", "#f97316", "Limited spots — arrive early or check nearby blocks.")),
-    (float("inf"), DemandInfo("Very High", "#ef4444", "Very hard to park — consider transit or a garage.")),
+    (
+        THRESHOLD_HIGH,
+        DemandInfo("High", "#f97316", "Limited spots — arrive early or check nearby blocks."),
+    ),
+    (
+        float("inf"),
+        DemandInfo("Very High", "#ef4444", "Very hard to park — consider transit or a garage."),
+    ),
 ]
 
 
@@ -56,8 +61,13 @@ def recommendation_for(pct: float) -> str:
 
 # ── Feature constants ──────────────────────────────────────────────
 LAG_COLS = [
-    "lag_1d", "lag_2d", "lag_7d", "lag_14d", "lag_28d",
-    "lag_3d_mean", "lag_7d_mean",
+    "lag_1d",
+    "lag_2d",
+    "lag_7d",
+    "lag_14d",
+    "lag_28d",
+    "lag_3d_mean",
+    "lag_7d_mean",
 ]
 
 # Cap on rows returned by /predict/blocks.

@@ -46,7 +46,11 @@ OPTIONAL_ARTIFACT_FILES = [
 
 # ── GCS helpers ────────────────────────────────────────────────────
 def _download_from_gcs(
-    bucket: str, prefix: str, files: List[str], dest: str, optional: bool = False,
+    bucket: str,
+    prefix: str,
+    files: List[str],
+    dest: str,
+    optional: bool = False,
 ) -> None:
     from google.cloud import storage  # lazy — local dev doesn't need it
 
@@ -71,7 +75,9 @@ def resolve_model_dir() -> str:
         try:
             logger.info(f"Fetching artifacts from gs://{GCS_BUCKET}/{GCS_PREFIX} …")
             _download_from_gcs(GCS_BUCKET, GCS_PREFIX, ARTIFACT_FILES, CACHE_DIR)
-            _download_from_gcs(GCS_BUCKET, GCS_PREFIX, OPTIONAL_ARTIFACT_FILES, CACHE_DIR, optional=True)
+            _download_from_gcs(
+                GCS_BUCKET, GCS_PREFIX, OPTIONAL_ARTIFACT_FILES, CACHE_DIR, optional=True
+            )
             return CACHE_DIR
         except Exception as e:  # noqa: BLE001
             logger.warning(f"GCS download failed ({e}); falling back to {LOCAL_MODEL_DIR}")
@@ -137,9 +143,8 @@ class ModelBundle:
         if not (os.path.exists(master_path) and "cnn" in self.blocks.columns):
             return
         try:
-            master = (
-                pd.read_parquet(master_path)[["cnn", "corridor", "limits"]]
-                .dropna(subset=["cnn"])
+            master = pd.read_parquet(master_path)[["cnn", "corridor", "limits"]].dropna(
+                subset=["cnn"]
             )
             master["cnn"] = master["cnn"].astype("Int64")
             blocks_cnn = self.blocks["cnn"].astype("Int64")
@@ -147,8 +152,7 @@ class ModelBundle:
             corridors = blocks_cnn.map(lookup["corridor"])
             limits_s = blocks_cnn.map(lookup["limits"])
             self.blocks["street"] = [
-                self._format_street(c, lim)
-                for c, lim in zip(corridors, limits_s)
+                self._format_street(c, lim) for c, lim in zip(corridors, limits_s)
             ]
         except Exception as e:
             logger.warning(f"master_blocks.parquet unreadable ({e}); all blocks will be dropped")

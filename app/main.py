@@ -117,7 +117,9 @@ def predict_blocks(req: BlocksRequest):
     target_hour = (req.hour + req.minutes_away // 60) % 24
 
     blocks = BUNDLE.blocks.copy()
-    blocks["distance_m"] = haversine_vec(req.lat, req.lon, blocks["lat"].to_numpy(), blocks["lon"].to_numpy())
+    blocks["distance_m"] = haversine_vec(
+        req.lat, req.lon, blocks["lat"].to_numpy(), blocks["lon"].to_numpy()
+    )
 
     nearby = blocks[blocks["distance_m"] <= req.radius_meters].sort_values("distance_m")
     if nearby.empty:
@@ -144,10 +146,13 @@ def predict_blocks(req: BlocksRequest):
 
 
 def _build_block_predictions(
-    feat_df: pd.DataFrame, preds: np.ndarray,
+    feat_df: pd.DataFrame,
+    preds: np.ndarray,
 ) -> List[BlockPrediction]:
     """Vectorized construction of BlockPrediction list from feature df + preds."""
-    result_df = feat_df[["lat", "lon", "street", "neighborhood", "total_spaces", "distance_m", "coverage"]].copy()
+    result_df = feat_df[
+        ["lat", "lon", "street", "neighborhood", "total_spaces", "distance_m", "coverage"]
+    ].copy()
     result_df["predicted_occupancy_pct"] = np.round(preds, 2)
     result_df["total_spaces"] = result_df["total_spaces"].fillna(0).astype(int)
     result_df["available_spaces_estimate"] = (
@@ -249,7 +254,8 @@ def geocode_proxy(q: str):
         filtered = [
             d
             for d in data
-            if "san francisco" in d.get("display_name", "").lower() or "california" in d.get("display_name", "").lower()
+            if "san francisco" in d.get("display_name", "").lower()
+            or "california" in d.get("display_name", "").lower()
         ]
         return filtered or data
     except Exception as e:  # noqa: BLE001
