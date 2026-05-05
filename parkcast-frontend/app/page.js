@@ -34,6 +34,7 @@ export default function MapPage() {
   const [showTimePicker, setShowTimePicker] = useState(false);
   const [hour, setHour] = useState(now.getHours());
   const [minutesAway, setMinutesAway] = useState(0);
+  const [searchRadius, setSearchRadius] = useState(200);
   const [conditions, setConditions] = useState({
     is_raining: 0, event_intensity: 0,
     is_holiday: 0, is_school_day: 1,
@@ -117,7 +118,7 @@ export default function MapPage() {
       .addTo(mapInstanceRef.current)
       .bindPopup(`<b>${destination.name}</b>`);
     circleRef.current = L.circle([destination.lat, destination.lon], {
-      radius: 600, color: '#0d9488', fillColor: '#0d9488',
+      radius: searchRadius, color: '#0d9488', fillColor: '#0d9488',
       fillOpacity: 0.05, weight: 1, dashArray: '4 4',
     }).addTo(mapInstanceRef.current);
     mapInstanceRef.current.setView([destination.lat, destination.lon], 15);
@@ -131,12 +132,13 @@ export default function MapPage() {
     markersRef.current = [];
     blocks.forEach(block => {
       const icon = L.divIcon({
-        html: `<div style="
+        html: `<div class="parking-marker" style="
           background:${block.color};border:2px solid white;
           border-radius:50%;width:40px;height:40px;
           display:flex;align-items:center;justify-content:center;
           font-size:12px;font-weight:700;
           color:white;box-shadow:0 2px 6px rgba(0,0,0,0.35);cursor:pointer;
+          transition:transform 0.15s ease, box-shadow 0.15s ease;
         ">${Math.round(block.predicted_occupancy_pct)}%</div>`,
         className: '', iconAnchor: [20, 20],
       });
@@ -251,7 +253,7 @@ export default function MapPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          lat: destination.lat, lon: destination.lon, radius_meters: 1500,
+          lat: destination.lat, lon: destination.lon, radius_meters: searchRadius,
           hour: arrivalHour, day_of_week: conditions.day_of_week, month: conditions.month,
           is_raining: conditions.is_raining, event_intensity: conditions.event_intensity,
           is_holiday: conditions.is_holiday, is_school_day: conditions.is_school_day,
@@ -340,6 +342,24 @@ export default function MapPage() {
 
         {/* Find parking button */}
         <div style={{ padding: '12px 16px', borderBottom: '1px solid #1e3a52' }}>
+          <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>
+            Search radius: <b style={{ color: '#14b8a6' }}>{searchRadius}m</b>
+            <span style={{ color: '#475569', fontSize: 10 }}> (~{Math.round(searchRadius/80)} min walk)</span>
+          </div>
+          <input 
+            type="range" 
+            min={100} max={1000} step={50} 
+            value={searchRadius}
+            onChange={e => setSearchRadius(+e.target.value)}
+            style={{ width: '100%', accentColor: '#0d9488' }} 
+          />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#475569', marginTop: 4 }}>
+            <span>100m</span><span>500m</span><span>1km</span>
+          </div>
+        </div>
+
+        {/* Find Parking button */}
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid #1e3a52' }}>
           <button onClick={handlePredict} disabled={loading || !destination}
             style={{
               width: '100%', padding: '12px', borderRadius: 8, border: 'none',
@@ -347,9 +367,8 @@ export default function MapPage() {
               color: !destination ? '#475569' : 'white',
               fontSize: 14, fontWeight: 700,
               cursor: (!destination || loading) ? 'not-allowed' : 'pointer',
-              transition: 'background 0.2s',
             }}>
-            {loading ? 'Predicting...' : !destination ? 'Enter a destination first' : showTimePicker ? `Find Parking (arriving in ${minutesAway} min)` : 'Find Parking Now'}
+            {loading ? 'Predicting...' : !destination ? 'Enter a destination first' : 'Find Parking Now'}
           </button>
           {error && (
             <div style={{ marginTop: 8, padding: '8px 12px', background: 'rgba(239,68,68,0.1)', border: '1px solid #7f1d1d', borderRadius: 6, color: '#fca5a5', fontSize: 12 }}>
