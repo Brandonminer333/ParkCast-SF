@@ -13,6 +13,16 @@ const DEMAND_BG = {
   'High': '#9a3412', 'Very High': '#7f1d1d',
 };
 
+// Same red→amber→green gradient the map uses; fallback when the API
+// row is missing `block.color`, otherwise the badge renders transparent
+// and the basemap bleeds through.
+const colorForPct = (pct) => {
+  if (pct == null || Number.isNaN(pct)) return '#475569';
+  const p = Math.max(0, Math.min(100, pct));
+  const hue = (1 - p / 100) * 120;
+  return `hsl(${hue.toFixed(0)}, 70%, 45%)`;
+};
+
 function RoutePanel({ routeInfo, onNextBest }) {
   return (
     <div style={{ padding: '10px 16px', background: '#0f2a3a', borderBottom: '1px solid #1e3a52' }}>
@@ -105,6 +115,11 @@ function Directions({ driveSteps, routeInfo }) {
 }
 
 function BlockCard({ block, isSelected, onClick }) {
+  const pct = block.predicted_occupancy_pct;
+  const hasPct = pct != null && !Number.isNaN(pct);
+  const badgeColor = block.color || colorForPct(pct);
+  const street = block.street || 'Unnamed block';
+  const demand = block.demand_level || '—';
   return (
     <div onClick={onClick}
       style={{
@@ -113,20 +128,20 @@ function BlockCard({ block, isSelected, onClick }) {
       }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
         <div style={{
-          width: 40, height: 40, borderRadius: 8, background: block.color,
+          width: 40, height: 40, borderRadius: 8, background: badgeColor,
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontWeight: 800, fontSize: 13, flexShrink: 0,
+          fontWeight: 800, fontSize: 13, flexShrink: 0, color: 'white',
         }}>
-          {Math.round(block.predicted_occupancy_pct)}%
+          {hasPct ? `${Math.round(pct)}%` : '—'}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: 'white', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{block.street}</div>
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'white', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{street}</div>
           <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
             {(block.distance_meters / 1609.344).toFixed(2)} mi away
           </div>
         </div>
-        <div style={{ fontSize: 10, padding: '3px 7px', borderRadius: 4, background: DEMAND_BG[block.demand_level] || '#1e3a52', color: block.color, fontWeight: 600, flexShrink: 0 }}>
-          {block.demand_level}
+        <div style={{ fontSize: 10, padding: '3px 7px', borderRadius: 4, background: DEMAND_BG[demand] || '#1e3a52', color: badgeColor, fontWeight: 600, flexShrink: 0 }}>
+          {demand}
         </div>
       </div>
     </div>
