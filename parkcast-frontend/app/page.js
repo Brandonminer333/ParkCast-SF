@@ -15,6 +15,7 @@ export default function MapPage() {
   const circleRef = useRef(null);
   const driveRouteRef = useRef(null);
   const walkRouteRef = useRef(null);
+  const destinationRef = useRef(null);
 
   const now = new Date();
   const [query, setQuery] = useState('');
@@ -69,13 +70,23 @@ export default function MapPage() {
 
   // ── Leaflet loading ───────────────────────────────────────────
   useEffect(() => {
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-    document.head.appendChild(link);
+    const addCss = (href) => {
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = href;
+      document.head.appendChild(link);
+    };
+    addCss('https://unpkg.com/leaflet@1.9.4/dist/leaflet.css');
+    addCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css');
+    addCss('https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css');
     const script = document.createElement('script');
     script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-    script.onload = () => setLeafletLoaded(true);
+    script.onload = () => {
+      const cluster = document.createElement('script');
+      cluster.src = 'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js';
+      cluster.onload = () => setLeafletLoaded(true);
+      document.head.appendChild(cluster);
+    };
     document.head.appendChild(script);
   }, []);
 
@@ -88,7 +99,32 @@ export default function MapPage() {
       attribution: '© OpenStreetMap contributors', maxZoom: 19,
     }).addTo(map);
     mapInstanceRef.current = map;
+
+    // Reset-view button — snaps back to destination, or SF default.
+    const ResetControl = L.Control.extend({
+      options: { position: 'topleft' },
+      onAdd: () => {
+        const btn = L.DomUtil.create('a', 'leaflet-bar leaflet-control pc-reset-btn');
+        btn.href = '#';
+        btn.title = 'Reset view';
+        btn.setAttribute('role', 'button');
+        btn.innerHTML = '⌖';
+        L.DomEvent.disableClickPropagation(btn);
+        L.DomEvent.on(btn, 'click', (e) => {
+          L.DomEvent.preventDefault(e);
+          const dest = destinationRef.current;
+          if (dest) map.flyTo([dest.lat, dest.lon], 15, { duration: 0.6 });
+          else map.flyTo([37.7749, -122.4194], 14, { duration: 0.6 });
+        });
+        return btn;
+      },
+    });
+    new ResetControl().addTo(map);
   }, [leafletLoaded]);
+
+  // Keep a live ref so the reset-view control closure always sees the
+  // current destination without needing to be recreated.
+  useEffect(() => { destinationRef.current = destination; }, [destination]);
 
   // ── User location marker ──────────────────────────────────────
   useEffect(() => {
@@ -110,11 +146,28 @@ export default function MapPage() {
     const L = window.L;
     if (destMarkerRef.current) destMarkerRef.current.remove();
     if (circleRef.current) circleRef.current.remove();
+    // Drop-style pin with a pulsing halo + permanent label so the
+    // destination is obvious even when the map is dense with markers.
+    const pinHtml = `
+      <div style="position:relative;width:42px;height:54px">
+        <div class="pc-dest-halo" style="
+          position:absolute;left:50%;top:42px;transform:translate(-50%,-50%);
+          width:34px;height:14px;border-radius:50%;
+          background:radial-gradient(closest-side, rgba(13,148,136,0.55), rgba(13,148,136,0));
+        "></div>
+        <svg width="42" height="54" viewBox="0 0 42 54" style="position:absolute;left:0;top:0;filter:drop-shadow(0 3px 5px rgba(0,0,0,0.4))">
+          <path d="M21 1 C9.4 1 1 9.4 1 21 c0 12 14 26 19 32 1 1 2 1 3 0 5-6 19-20 19-32 C42 9.4 32.6 1 21 1 Z"
+                fill="#0d9488" stroke="#ffffff" stroke-width="2.5"/>
+          <circle cx="21" cy="20" r="6.5" fill="#ffffff"/>
+        </svg>
+      </div>`;
     const icon = L.divIcon({
-      html: `<div style="width:20px;height:20px;border-radius:50%;background:#0d9488;border:3px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.4)"></div>`,
-      iconSize: [20, 20], iconAnchor: [10, 10], className: '',
+      html: pinHtml,
+      iconSize: [42, 54], iconAnchor: [21, 50], className: '',
     });
-    destMarkerRef.current = L.marker([destination.lat, destination.lon], { icon })
+    destMarkerRef.current = L.marker([destination.lat, destination.lon], {
+      icon, zIndexOffset: 1000,
+    })
       .addTo(mapInstanceRef.current)
       .bindPopup(`<b>${destination.name}</b>`);
     circleRef.current = L.circle([destination.lat, destination.lon], {
@@ -124,38 +177,128 @@ export default function MapPage() {
     mapInstanceRef.current.setView([destination.lat, destination.lon], 15);
   }, [destination, leafletLoaded]);
 
-  // ── Block markers ─────────────────────────────────────────────
+  // ── Block markers (clustered + gradient + best-block highlight) ─
+  // Bubbles cluster when zoomed out so the map isn't a wall of overlap.
+  // Color is a red→amber→green gradient on predicted occupancy; cluster
+  // bubbles show the average occupancy of their children. The lowest-
+  // occupancy block gets a pulsing ring as a clear "park here" cue.
   useEffect(() => {
     if (!mapInstanceRef.current || !leafletLoaded) return;
     const L = window.L;
-    markersRef.current.forEach(m => m.remove());
-    markersRef.current = [];
-    blocks.forEach(block => {
-      const icon = L.divIcon({
-        html: `<div class="parking-marker" style="
-          background:${block.color};border:2px solid white;
-          border-radius:50%;width:40px;height:40px;
-          display:flex;align-items:center;justify-content:center;
-          font-size:12px;font-weight:700;
-          color:white;box-shadow:0 2px 6px rgba(0,0,0,0.35);cursor:pointer;
-          transition:transform 0.15s ease, box-shadow 0.15s ease;
-        ">${Math.round(block.predicted_occupancy_pct)}%</div>`,
-        className: '', iconAnchor: [20, 20],
-      });
-      const marker = L.marker([block.lat, block.lon], { icon })
-        .addTo(mapInstanceRef.current)
-        .bindPopup(`
-          <div style="font-family:sans-serif;min-width:210px;padding:4px">
-            <b style="font-size:13px">${block.street}</b><br>
-            <span style="color:${block.color};font-size:20px;font-weight:700">${block.predicted_occupancy_pct}%</span>
-            <span style="color:#666;font-size:13px"> occupied</span><br>
-            <span style="color:#333;font-size:13px">${block.demand_level} demand</span><br>
-            <span style="color:#888;font-size:11px">${(block.distance_meters / 1609.344).toFixed(2)} mi from destination</span>
-          </div>
-        `);
-      marker.on('click', () => { setSelectedBlock(block); drawBlockRoutes(block); });
-      markersRef.current.push(marker);
+    const map = mapInstanceRef.current;
+
+    if (markersRef.current.length) {
+      markersRef.current.forEach(m => m.remove ? m.remove() : map.removeLayer(m));
+      markersRef.current = [];
+    }
+    if (!blocks.length) return;
+
+    const colorFor = (pct) => {
+      const p = Math.max(0, Math.min(100, pct));
+      const hue = (1 - p / 100) * 120; // 120=green, 0=red
+      return `hsl(${hue.toFixed(0)}, 70%, 45%)`;
+    };
+
+    const cluster = L.markerClusterGroup({
+      showCoverageOnHover: false,
+      spiderfyOnMaxZoom: true,
+      animate: true,
+      animateAddingMarkers: false,
+      zoomToBoundsOnClick: true,
+      // Smooth radius curve — clusters dissolve naturally as zoom rises.
+      maxClusterRadius: (zoom) => {
+        if (zoom <= 13) return 80;
+        if (zoom <= 14) return 65;
+        if (zoom <= 15) return 50;
+        if (zoom <= 16) return 36;
+        if (zoom <= 17) return 24;
+        if (zoom <= 18) return 14;
+        return 1;
+      },
+      iconCreateFunction: (c) => {
+        const children = c.getAllChildMarkers();
+        const avg =
+          children.reduce((s, m) => s + (m.options._pct || 0), 0) / children.length;
+        const color = colorFor(avg);
+        const n = children.length;
+        const size = n < 10 ? 36 : n < 50 ? 44 : 52;
+        return L.divIcon({
+          html: `<div style="
+            background:${color};border:3px solid white;
+            border-radius:50%;width:${size}px;height:${size}px;
+            display:flex;flex-direction:column;align-items:center;justify-content:center;
+            color:white;font-family:sans-serif;font-weight:700;
+            box-shadow:0 2px 8px rgba(0,0,0,0.35);
+          ">
+            <div style="font-size:13px;line-height:1">${n}</div>
+            <div style="font-size:10px;line-height:1;opacity:0.9;margin-top:2px">${Math.round(avg)}%</div>
+          </div>`,
+          className: '',
+          iconSize: [size, size],
+          iconAnchor: [size / 2, size / 2],
+        });
+      },
     });
+
+    // Lowest-occupancy block — highlighted as the recommended pick.
+    let bestBlock = null;
+    blocks.forEach(b => {
+      if (!bestBlock || b.predicted_occupancy_pct < bestBlock.predicted_occupancy_pct) {
+        bestBlock = b;
+      }
+    });
+
+    blocks.forEach(block => {
+      const color = colorFor(block.predicted_occupancy_pct);
+      const isBest = block === bestBlock;
+      const size = isBest ? 32 : 24;
+      const fontSize = isBest ? 11 : 10;
+      const html = isBest
+        ? `<div class="pc-best-pulse parking-marker" style="
+            background:${color};border:3px solid white;
+            border-radius:50%;width:${size}px;height:${size}px;
+            display:flex;align-items:center;justify-content:center;
+            color:white;font:700 ${fontSize}px sans-serif;
+            box-shadow:0 0 0 4px ${color}55, 0 2px 6px rgba(0,0,0,0.4);
+            cursor:pointer;transition:transform 0.15s ease, box-shadow 0.15s ease;
+          ">${Math.round(block.predicted_occupancy_pct)}%</div>`
+        : `<div class="parking-marker" style="
+            background:${color};border:2px solid white;
+            border-radius:50%;width:${size}px;height:${size}px;
+            display:flex;align-items:center;justify-content:center;
+            color:white;font:700 ${fontSize}px sans-serif;
+            box-shadow:0 1px 4px rgba(0,0,0,0.4);
+            cursor:pointer;transition:transform 0.15s ease, box-shadow 0.15s ease;
+          ">${Math.round(block.predicted_occupancy_pct)}%</div>`;
+      const icon = L.divIcon({
+        html, className: '',
+        iconSize: [size, size], iconAnchor: [size / 2, size / 2],
+      });
+      const tooltip = `
+        <div style="font-family:sans-serif;line-height:1.3">
+          <b style="font-size:12px">${block.street}</b><br>
+          <span style="color:${color};font-weight:700">${block.predicted_occupancy_pct}%</span>
+          <span style="color:#666"> occupied · ${block.demand_level}</span>
+        </div>`;
+      const popup = `
+        <div style="font-family:sans-serif;min-width:210px;padding:4px">
+          <b style="font-size:13px">${block.street}</b><br>
+          <span style="color:${color};font-size:20px;font-weight:700">${block.predicted_occupancy_pct}%</span>
+          <span style="color:#666;font-size:13px"> occupied</span><br>
+          <span style="color:#333;font-size:13px">${block.demand_level} demand</span><br>
+          <span style="color:#888;font-size:11px">${(block.distance_meters / 1609.344).toFixed(2)} mi from destination</span>
+        </div>`;
+      const marker = L.marker([block.lat, block.lon], {
+        icon, _pct: block.predicted_occupancy_pct,
+      })
+        .bindTooltip(tooltip, { direction: 'top', offset: [0, -size / 2 - 2], opacity: 0.95 })
+        .bindPopup(popup);
+      marker.on('click', () => { setSelectedBlock(block); drawBlockRoutes(block); });
+      cluster.addLayer(marker);
+    });
+
+    cluster.addTo(map);
+    markersRef.current.push(cluster);
   }, [blocks, leafletLoaded]);
 
   // ── Clear routes when blocks change ───────────────────────────
@@ -262,8 +405,11 @@ export default function MapPage() {
       });
       if (!res.ok) throw new Error();
       const data = await res.json();
-      setBlocks(data.blocks);
-      if (data.blocks.length === 0) setError('No parking blocks found in this area. Try a different location.');
+      const named = (data.blocks || []).filter(
+        b => b.street && String(b.street).trim() !== '',
+      );
+      setBlocks(named);
+      if (named.length === 0) setError('No parking blocks found in this area. Try a different location.');
     } catch {
       setError('Could not get predictions. Make sure the API is running.');
     } finally {
