@@ -139,7 +139,14 @@ class ModelBundle:
 
     @staticmethod
     def _build_lag_lookup(src: str) -> Optional[pd.DataFrame]:
-        """Precompute lag_{1,2,7,14,28}d for every (lat, lon, hour, dow) slot.
+        """Precompute every lag feature the model uses, per (lat, lon, hour, dow).
+
+        Point lags (lag_1d, lag_2d, lag_7d, lag_14d, lag_28d) and rolling
+        means (lag_3d_mean = mean of lag_{1..3}d, lag_7d_mean = mean of
+        lag_{1..7}d) are all derived. Filling the rolling means is critical:
+        if the model trained with them and inference leaves them NaN while
+        the point lags are real, the mixed missingness sends the model down
+        unfamiliar surrogate paths and predictions collapse toward the mean.
 
         For each slot, the anchor is the most-recent matching timestamp in
         ``lag_history.parquet``; lag_kd is the block's occupancy at
@@ -164,15 +171,34 @@ class ModelBundle:
             ]
         )
 
+        # Compute days 1..7 (needed for lag_7d_mean), plus 14 and 28.
+        all_days = list(range(1, 8)) + [14, 28]
         out = anchor
-        for d in (1, 2, 7, 14, 28):
+        for d in all_days:
             shifted = lh[["lat", "lon", "timestamp", "occupancy_pct"]].copy()
             shifted["anchor_ts"] = shifted["timestamp"] + pd.Timedelta(days=d)
             shifted = shifted.rename(columns={"occupancy_pct": f"lag_{d}d"})[
                 ["lat", "lon", "anchor_ts", f"lag_{d}d"]
             ]
             out = out.merge(shifted, on=["lat", "lon", "anchor_ts"], how="left")
-        return out.drop(columns=["anchor_ts"])
+
+        out["lag_3d_mean"] = out[[f"lag_{d}d" for d in (1, 2, 3)]].mean(axis=1)
+        out["lag_7d_mean"] = out[[f"lag_{d}d" for d in range(1, 8)]].mean(axis=1)
+
+        keep = [
+            "lat",
+            "lon",
+            "hour",
+            "day_of_week",
+            "lag_1d",
+            "lag_2d",
+            "lag_7d",
+            "lag_14d",
+            "lag_28d",
+            "lag_3d_mean",
+            "lag_7d_mean",
+        ]
+        return out[keep]
 
     def _backfill_coverage(self) -> None:
         """Older metered-only bundles lack the ``coverage`` column."""
