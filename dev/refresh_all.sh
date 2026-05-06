@@ -163,7 +163,7 @@ print(d['metrics']['residual_model']['mae'])
 ")
 
 INCUMBENT_MAE=$(python3 -c "
-import json, os, sys
+import json, os, sys, math
 p = '$INCUMBENT_META'
 if not os.path.exists(p) or os.path.getsize(p) == 0:
     print('inf')
@@ -179,12 +179,9 @@ echo ""
 echo "  incumbent (GCS) MAE: $INCUMBENT_MAE"
 echo "  challenger     MAE: $CHALLENGER_MAE"
 
-SHOULD_UPLOAD=$(python3 -c "
-incumbent = float('$INCUMBENT_MAE')
-challenger = float('$CHALLENGER_MAE')
-# Allow a tiny tolerance so ties upload (keeps MLflow run_id fresh in meta).
-print('1' if challenger <= incumbent + 1e-4 else '0')
-")
+SHOULD_UPLOAD=$(python3 -m dev.promote_decision \
+  --challenger app/models/LightGBM.meta.json \
+  --incumbent  "$INCUMBENT_META")
 
 CHALLENGER_RUN_ID=$(python3 -c "
 import json
