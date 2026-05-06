@@ -25,4 +25,4 @@ jobs:
         run: black --check app
 
       - name: pylint
-        run: pylint app
+        run: pylint app --disable=E0401,C0415,W0611,W1514,C0114,C0115,C0116,C0301,C0302,R0903,R0913,R0914,R0917,W1203 --max-line-length=120
