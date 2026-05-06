@@ -57,7 +57,7 @@ jobs:
             "pytest>=8.0"
 
       - name: Run pytest
-        # Runs every marker (unit, functional, integration, application).
+        # Runs every marker (unit, functional, integration, application, model).
         # Integration + application tests load the legacy on-disk model from
         # `app/models/` because the repo commits those artifacts; the MLflow
         # smoke test in `tests/test_integration.py` skips when

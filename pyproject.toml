@@ -66,4 +66,5 @@ markers = [
     "functional: single-endpoint tests via TestClient with an in-memory fake model and parking DB",
     "integration: in-process tests against the real model + real parquet assets + real Open-Meteo weather API",
     "application: end-to-end tests against a live uvicorn server bound to a localhost port",
+    "model: tests targeting the ML model + feature pipeline (ModelBundle, build_features, predict_rows)",
 ]
