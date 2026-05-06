@@ -74,9 +74,12 @@ def build_features(
         df["block_mean"] = df["block_mean"].fillna(df["_inf_bm"])
         df = df.drop(columns=["_inf_bhd", "_inf_bh", "_inf_bm"])
 
-    # Lags stay NaN — LightGBM uses surrogate splits for missing features.
+    lag_lookup = getattr(bundle, "lag_lookup", None)
+    if lag_lookup is not None:
+        df = df.merge(lag_lookup, on=["lat", "lon", "hour", "day_of_week"], how="left")
     for col in LAG_COLS:
-        df[col] = np.nan
+        if col not in df.columns:
+            df[col] = np.nan
 
     df["neighborhood"] = df["neighborhood"].astype(bundle.neighborhood_dtype)
 

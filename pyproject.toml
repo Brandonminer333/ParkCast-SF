@@ -50,6 +50,8 @@ disable = [
     "invalid-name",
     "logging-fstring-interpolation",
     "duplicate-code",
+    "import-outside-toplevel",
+    "unspecified-encoding",
 ]
 
 [tool.pylint.design]

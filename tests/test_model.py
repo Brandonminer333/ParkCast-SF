@@ -70,9 +70,7 @@ def test_build_features_baseline_falls_back_to_global_mean(fake_bundle):
     sunset_row = feat_df[feat_df["neighborhood"] == "sunset"].iloc[0]
     assert sunset_row["_baseline"] == pytest.approx(fake_bundle.global_mean)
 
-    soma_row = feat_df[
-        (feat_df["lat"] == 37.7816) & (feat_df["lon"] == -122.3975)
-    ].iloc[0]
+    soma_row = feat_df[(feat_df["lat"] == 37.7816) & (feat_df["lon"] == -122.3975)].iloc[0]
     # block_hour_dow_mean = 65.0 wins over the other (lower-priority) means.
     assert soma_row["_baseline"] == pytest.approx(65.0)
 
@@ -113,9 +111,9 @@ def test_predict_rows_clips_to_valid_occupancy_range(fake_bundle):
 # ── 5. Lag columns stay NaN at inference ───────────────────────────
 
 
-def test_build_features_leaves_lag_columns_nan(fake_bundle):
-    """Training lag_history ends at the temporal split, so inference relies
-    on LightGBM's surrogate splits — every lag column must be NaN here."""
+def test_build_features_leaves_lag_columns_nan_when_lookup_missing(fake_bundle):
+    """When the bundle has no lag_lookup (e.g. lag_history.parquet absent),
+    every lag column falls back to NaN and LightGBM uses surrogate splits."""
     from app.constants import LAG_COLS
 
     req = _make_request()
@@ -123,6 +121,36 @@ def test_build_features_leaves_lag_columns_nan(fake_bundle):
 
     for col in LAG_COLS:
         assert feat_df[col].isna().all(), f"{col} should be NaN at inference"
+
+
+def test_build_features_uses_lag_lookup_when_present(fake_bundle):
+    """When a lag_lookup is attached, build_features merges its values onto
+    matching (lat, lon, hour, dow) rows instead of leaving them NaN."""
+    req = _make_request()
+    lookup = pd.DataFrame(
+        [
+            {
+                "lat": 37.7816,
+                "lon": -122.3975,
+                "hour": req.hour,
+                "day_of_week": req.day_of_week,
+                "lag_1d": 41.0,
+                "lag_2d": 42.0,
+                "lag_7d": 47.0,
+                "lag_14d": 48.0,
+                "lag_28d": 49.0,
+            }
+        ]
+    )
+    fake_bundle.lag_lookup = lookup
+
+    feat_df = build_features(fake_bundle.blocks, target_hour=req.hour, req=req, bundle=fake_bundle)
+    soma = feat_df[(feat_df["lat"] == 37.7816) & (feat_df["lon"] == -122.3975)].iloc[0]
+    assert soma["lag_1d"] == 41.0
+    assert soma["lag_28d"] == 49.0
+    # Blocks not in the lookup keep NaN.
+    other = feat_df[feat_df["neighborhood"] == "sunset"].iloc[0]
+    assert pd.isna(other["lag_1d"])
 
 
 # ── 6. ModelBundle exposes a usable model ──────────────────────────

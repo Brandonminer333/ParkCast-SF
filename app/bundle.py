@@ -131,6 +131,49 @@ class ModelBundle:
             pd.read_parquet(inferred_path) if os.path.exists(inferred_path) else None
         )
 
+        # Per-(block, hour, dow) lag values precomputed from lag_history.
+        # The feature builder previously set lag columns to NaN at inference,
+        # which made the residual head add noise instead of signal — served
+        # MAE ended up worse than the bare block×hour×dow baseline.
+        self.lag_lookup: Optional[pd.DataFrame] = self._build_lag_lookup(src)
+
+    @staticmethod
+    def _build_lag_lookup(src: str) -> Optional[pd.DataFrame]:
+        """Precompute lag_{1,2,7,14,28}d for every (lat, lon, hour, dow) slot.
+
+        For each slot, the anchor is the most-recent matching timestamp in
+        ``lag_history.parquet``; lag_kd is the block's occupancy at
+        ``anchor - k days``. Anchoring on (hour, dow) — rather than on a true
+        target timestamp the request schema doesn't carry — keeps the lag
+        semantics close to training (point-in-time block occupancy) without
+        requiring API changes.
+        """
+        path = os.path.join(src, "lag_history.parquet")
+        if not os.path.exists(path):
+            return None
+        lh = pd.read_parquet(path)
+        lh["hour"] = lh["timestamp"].dt.hour
+        lh["day_of_week"] = lh["timestamp"].dt.weekday
+
+        anchor = (
+            lh.sort_values("timestamp")
+            .groupby(["lat", "lon", "hour", "day_of_week"], as_index=False)
+            .tail(1)
+            .rename(columns={"timestamp": "anchor_ts"})[
+                ["lat", "lon", "hour", "day_of_week", "anchor_ts"]
+            ]
+        )
+
+        out = anchor
+        for d in (1, 2, 7, 14, 28):
+            shifted = lh[["lat", "lon", "timestamp", "occupancy_pct"]].copy()
+            shifted["anchor_ts"] = shifted["timestamp"] + pd.Timedelta(days=d)
+            shifted = shifted.rename(columns={"occupancy_pct": f"lag_{d}d"})[
+                ["lat", "lon", "anchor_ts", f"lag_{d}d"]
+            ]
+            out = out.merge(shifted, on=["lat", "lon", "anchor_ts"], how="left")
+        return out.drop(columns=["anchor_ts"])
+
     def _backfill_coverage(self) -> None:
         """Older metered-only bundles lack the ``coverage`` column."""
         if "coverage" not in self.blocks.columns:
