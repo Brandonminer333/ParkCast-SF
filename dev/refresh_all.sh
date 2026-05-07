@@ -39,7 +39,11 @@ fetch() {
   local ext="${1##*.}"
   local url="$SODA_BASE/$id.$ext?\$limit=$limit"
   echo "  $1 ($id, limit=$limit)"
-  if ! curl -fsSL --max-time 1200 -o "$out.tmp" "$url"; then
+  # --retry handles transient DataSF flakiness (timeouts, 5xx, 429). Without
+  # it, one bad pull halts the whole 4-hour pipeline.
+  if ! curl -fsSL --max-time 1200 \
+        --retry 5 --retry-delay 5 --retry-all-errors \
+        -o "$out.tmp" "$url"; then
     rm -f "$out.tmp"
     echo "ERROR: SODA fetch failed for $1 ($url)" >&2
     exit 1
@@ -63,9 +67,11 @@ fetch parking_citations.csv     ab4h-6ztd  3000000
 # hourly observations for SF center. preprocess_real_data.ipynb reads
 # weather.csv; weather_raw.json is the unflattened source-of-truth.
 echo "  weather.csv (Open-Meteo Archive, rolling 365 days)"
-python3 - "$PROJECT_DIR/data" <<'PY'
-import datetime, json, os, sys, urllib.request
+PROJECT_DIR="$PROJECT_DIR" python3 - "$PROJECT_DIR/data" <<'PY'
+import datetime, json, os, sys
 import pandas as pd
+sys.path.insert(0, os.path.join(os.environ["PROJECT_DIR"], "dev"))
+from _http import retry_urlopen
 out_dir = sys.argv[1]
 end = datetime.date.today()
 start = end - datetime.timedelta(days=365)
@@ -77,8 +83,7 @@ url = (
     "&timezone=auto"
 )
 print(f"    range: {start} → {end}")
-with urllib.request.urlopen(url, timeout=120) as r:
-    data = json.load(r)
+data = json.loads(retry_urlopen(url, timeout=120))
 with open(os.path.join(out_dir, "weather_raw.json"), "w") as f:
     json.dump(data, f)
 df = pd.DataFrame(data["hourly"])
