@@ -166,7 +166,7 @@ export default function MapPage() {
       iconSize: [42, 54], iconAnchor: [21, 50], className: '',
     });
     destMarkerRef.current = L.marker([destination.lat, destination.lon], {
-      icon, zIndexOffset: 1000,
+      icon,
     })
       .addTo(mapInstanceRef.current)
       .bindPopup(`<b>${destination.name}</b>`);
@@ -205,16 +205,13 @@ export default function MapPage() {
       animate: true,
       animateAddingMarkers: false,
       zoomToBoundsOnClick: true,
-      // Smooth radius curve — clusters dissolve naturally as zoom rises.
-      maxClusterRadius: (zoom) => {
-        if (zoom <= 13) return 80;
-        if (zoom <= 14) return 65;
-        if (zoom <= 15) return 50;
-        if (zoom <= 16) return 36;
-        if (zoom <= 17) return 24;
-        if (zoom <= 18) return 14;
-        return 1;
-      },
+      // Single-marker-mode + a hard zoom cliff guarantees the map is
+      // never mixed: at zoom < 17 every marker renders as a cluster
+      // bubble (even singletons), at zoom >= 17 every marker renders
+      // as an individual bubble. No same-zoom mixing.
+      singleMarkerMode: true,
+      disableClusteringAtZoom: 17,
+      maxClusterRadius: 80,
       iconCreateFunction: (c) => {
         const children = c.getAllChildMarkers();
         const avg =
@@ -492,12 +489,12 @@ export default function MapPage() {
             Search radius: <b style={{ color: '#14b8a6' }}>{searchRadius}m</b>
             <span style={{ color: '#475569', fontSize: 10 }}> (~{Math.round(searchRadius/80)} min walk)</span>
           </div>
-          <input 
-            type="range" 
-            min={100} max={1000} step={50} 
+          <input
+            type="range"
+            min={100} max={1000} step={50}
             value={searchRadius}
             onChange={e => setSearchRadius(+e.target.value)}
-            style={{ width: '100%', accentColor: '#0d9488' }} 
+            style={{ width: '100%', accentColor: '#0d9488' }}
           />
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#475569', marginTop: 4 }}>
             <span>100m</span><span>500m</span><span>1km</span>

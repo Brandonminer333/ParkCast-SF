@@ -117,7 +117,9 @@ function Directions({ driveSteps, routeInfo }) {
 function BlockCard({ block, isSelected, onClick }) {
   const pct = block.predicted_occupancy_pct;
   const hasPct = pct != null && !Number.isNaN(pct);
-  const badgeColor = block.color || colorForPct(pct);
+  // Always derive color from pct so a malformed `block.color` from the
+  // API can't sneak through and render the badge transparent.
+  const badgeColor = colorForPct(hasPct ? pct : null);
   const street = block.street || 'Unnamed block';
   const demand = block.demand_level || '—';
   return (
