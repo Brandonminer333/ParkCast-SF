@@ -13,14 +13,14 @@ const DEMAND_BG = {
   'High': '#9a3412', 'Very High': '#7f1d1d',
 };
 
-// Same red→amber→green gradient the map uses; fallback when the API
-// row is missing `block.color`, otherwise the badge renders transparent
-// and the basemap bleeds through.
+// Match the backend's discrete demand bands (app/constants.py):
+// <40 Low (green), <70 Medium (amber), <85 High (orange), else Very High (red).
 const colorForPct = (pct) => {
   if (pct == null || Number.isNaN(pct)) return '#475569';
-  const p = Math.max(0, Math.min(100, pct));
-  const hue = (1 - p / 100) * 120;
-  return `hsl(${hue.toFixed(0)}, 70%, 45%)`;
+  if (pct < 40) return '#22c55e';
+  if (pct < 70) return '#facc15';
+  if (pct < 85) return '#f97316';
+  return '#ef4444';
 };
 
 function RoutePanel({ routeInfo, onNextBest }) {

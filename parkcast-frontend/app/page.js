@@ -140,14 +140,16 @@ export default function MapPage() {
       .bindPopup('Your location');
   }, [userLocation, leafletLoaded]);
 
-  // ── Destination marker + radius circle ────────────────────────
+  // ── Destination pin + initial recenter ────────────────────────
+  // Runs only when the destination itself changes — drops the pin and
+  // pans the map there. Slider movement does NOT recenter, which keeps
+  // the user's pan position when they're tweaking the radius.
   useEffect(() => {
     if (!mapInstanceRef.current || !leafletLoaded || !destination) return;
     const L = window.L;
     if (destMarkerRef.current) destMarkerRef.current.remove();
-    if (circleRef.current) circleRef.current.remove();
-    // Drop-style pin with a pulsing halo + permanent label so the
-    // destination is obvious even when the map is dense with markers.
+    // Drop-style pin with a pulsing halo so the destination is obvious
+    // even when the map is dense with markers.
     const pinHtml = `
       <div style="position:relative;width:42px;height:54px">
         <div class="pc-dest-halo" style="
@@ -170,12 +172,20 @@ export default function MapPage() {
     })
       .addTo(mapInstanceRef.current)
       .bindPopup(`<b>${destination.name}</b>`);
-    circleRef.current = L.circle([destination.lat, destination.lon], {
-      radius: searchRadius, color: '#0d9488', fillColor: '#0d9488',
-      fillOpacity: 0.05, weight: 1, dashArray: '4 4',
-    }).addTo(mapInstanceRef.current);
     mapInstanceRef.current.setView([destination.lat, destination.lon], 15);
   }, [destination, leafletLoaded]);
+
+  // ── Radius circle ─────────────────────────────────────────────
+  // Tracks the slider in real time without re-centering the map.
+  useEffect(() => {
+    if (!mapInstanceRef.current || !leafletLoaded || !destination) return;
+    const L = window.L;
+    if (circleRef.current) circleRef.current.remove();
+    circleRef.current = L.circle([destination.lat, destination.lon], {
+      radius: searchRadius, color: '#0d9488', fillColor: '#99f6e4',
+      fillOpacity: 0.18, weight: 2.5, opacity: 0.9, dashArray: '8 6',
+    }).addTo(mapInstanceRef.current);
+  }, [destination, leafletLoaded, searchRadius]);
 
   // ── Block markers (clustered + gradient + best-block highlight) ─
   // Bubbles cluster when zoomed out so the map isn't a wall of overlap.
@@ -193,10 +203,14 @@ export default function MapPage() {
     }
     if (!blocks.length) return;
 
+    // Match the backend's discrete demand bands (constants.py):
+    // <40 Low (green), <70 Medium (amber), <85 High (orange), else Very High (red).
     const colorFor = (pct) => {
-      const p = Math.max(0, Math.min(100, pct));
-      const hue = (1 - p / 100) * 120; // 120=green, 0=red
-      return `hsl(${hue.toFixed(0)}, 70%, 45%)`;
+      if (pct == null || Number.isNaN(pct)) return '#475569';
+      if (pct < 40) return '#22c55e';
+      if (pct < 70) return '#facc15';
+      if (pct < 85) return '#f97316';
+      return '#ef4444';
     };
 
     const cluster = L.markerClusterGroup({

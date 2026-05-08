@@ -24,7 +24,7 @@ class DemandInfo(NamedTuple):
 
 _BANDS: list[tuple[float, DemandInfo]] = [
     (THRESHOLD_LOW, DemandInfo("Low", "#22c55e", "Easy to park — plenty of spaces.")),
-    (THRESHOLD_MEDIUM, DemandInfo("Medium", "#f59e0b", "Good chance of parking — head over.")),
+    (THRESHOLD_MEDIUM, DemandInfo("Medium", "#facc15", "Good chance of parking — head over.")),
     (
         THRESHOLD_HIGH,
         DemandInfo("High", "#f97316", "Limited spots — arrive early or check nearby blocks."),
