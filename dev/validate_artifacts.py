@@ -35,6 +35,15 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "required_cols": ["lat", "lon", "hour", "day_of_week", "block_hour_dow_mean"],
         "max_nan": {"lat": 0.0, "lon": 0.0, "block_hour_dow_mean": 0.0},
     },
+    # Held-out test set saved pre-block_aggs by train_lightgbm.ipynb so the
+    # promotion gate can rescore the incumbent on the same rows. Local-only;
+    # not uploaded to GCS.
+    "LightGBM.test_set.parquet": {
+        "min_rows": 100_000,
+        "required_cols": ["lat", "lon", "hour", "day_of_week", "neighborhood",
+                          "occupancy_pct"],
+        "max_nan": {"lat": 0.0, "lon": 0.0, "occupancy_pct": 0.0},
+    },
     "lag_history.parquet": {
         "min_rows": 50_000,
         "required_cols": ["lat", "lon", "timestamp", "occupancy_pct"],

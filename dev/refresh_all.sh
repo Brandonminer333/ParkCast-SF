@@ -156,10 +156,18 @@ gsutil -m cp \
   "$GCS_TARGET"
 
 # Guard the model upload — only overwrite if the new run is at least as
-# good as the one currently in GCS.
-INCUMBENT_META=$(mktemp)
-trap 'rm -f "$INCUMBENT_META"' EXIT
-gsutil cp "${GCS_TARGET}LightGBM.meta.json" "$INCUMBENT_META" 2>/dev/null || true
+# good as the one currently in GCS, evaluated on the challenger's test set
+# (apples-to-apples; the stored incumbent MAE is from a different test
+# window so it would unfairly favor the incumbent as data drifts forward).
+INCUMBENT_DIR=$(mktemp -d)
+trap 'rm -rf "$INCUMBENT_DIR"' EXIT
+INCUMBENT_META="$INCUMBENT_DIR/LightGBM.meta.json"
+INCUMBENT_PKL="$INCUMBENT_DIR/LightGBM.pkl"
+INCUMBENT_AGGS="$INCUMBENT_DIR/LightGBM.block_aggs.parquet"
+RESCORED_META="$INCUMBENT_DIR/LightGBM.rescored.meta.json"
+gsutil cp "${GCS_TARGET}LightGBM.meta.json"          "$INCUMBENT_META" 2>/dev/null || true
+gsutil cp "${GCS_TARGET}LightGBM.pkl"                "$INCUMBENT_PKL"  2>/dev/null || true
+gsutil cp "${GCS_TARGET}LightGBM.block_aggs.parquet" "$INCUMBENT_AGGS" 2>/dev/null || true
 
 CHALLENGER_MAE=$(python3 -c "
 import json
@@ -167,9 +175,28 @@ d = json.load(open('app/models/LightGBM.meta.json'))
 print(d['metrics']['residual_model']['mae'])
 ")
 
+# Rescore the incumbent on the challenger's saved test set. Writes
+# $RESCORED_META on success; exits 0 without writing if any incumbent
+# artifact is missing (cold start), so the gate falls through to the
+# stored-MAE comparison below.
+python3 -m dev.score_incumbent \
+  --challenger-test app/models/LightGBM.test_set.parquet \
+  --incumbent-pkl   "$INCUMBENT_PKL" \
+  --incumbent-meta  "$INCUMBENT_META" \
+  --incumbent-aggs  "$INCUMBENT_AGGS" \
+  --out             "$RESCORED_META"
+
+if [ -s "$RESCORED_META" ]; then
+  INCUMBENT_FOR_GATE="$RESCORED_META"
+  GATE_MODE="rescored on challenger test set"
+else
+  INCUMBENT_FOR_GATE="$INCUMBENT_META"
+  GATE_MODE="stored MAE (no rescore — cold start or missing artifact)"
+fi
+
 INCUMBENT_MAE=$(python3 -c "
-import json, os, sys, math
-p = '$INCUMBENT_META'
+import json, os, sys
+p = '$INCUMBENT_FOR_GATE'
 if not os.path.exists(p) or os.path.getsize(p) == 0:
     print('inf')
     sys.exit(0)
@@ -181,12 +208,13 @@ except Exception:
 ")
 
 echo ""
-echo "  incumbent (GCS) MAE: $INCUMBENT_MAE"
-echo "  challenger     MAE: $CHALLENGER_MAE"
+echo "  gate mode:      $GATE_MODE"
+echo "  incumbent MAE:  $INCUMBENT_MAE"
+echo "  challenger MAE: $CHALLENGER_MAE"
 
 SHOULD_UPLOAD=$(python3 -m dev.promote_decision \
   --challenger app/models/LightGBM.meta.json \
-  --incumbent  "$INCUMBENT_META")
+  --incumbent  "$INCUMBENT_FOR_GATE")
 
 CHALLENGER_RUN_ID=$(python3 -c "
 import json
